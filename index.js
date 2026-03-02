@@ -59,13 +59,14 @@ function limiter(max = 6) {
   };
 }
 
-// ---- MCP server (global, stable) ----
+// ---- MCP server factory (NEW SERVER PER SESSION) ----
 function createMcpServer() {
   const server = new McpServer(
     { name: 'zendesk-readonly-mcp', version: '1.0.0' },
     { capabilities: { logging: {} } }
   );
 
+  // ping (debug)
   server.registerTool(
     'ping',
     {
@@ -78,7 +79,9 @@ function createMcpServer() {
     })
   );
 
-  // The ONE tool your CX spec needs (normalized schema)
+  /**
+   * list_tickets (your required schema)
+   */
   server.registerTool(
     'list_tickets',
     {
@@ -87,15 +90,9 @@ function createMcpServer() {
       inputSchema: z.object({
         days: z.number().int().min(1).max(30).optional().default(7),
         per_page: z.number().int().min(1).max(100).optional().default(50),
-
-        // For performance: set false if you only need metadata
         include_comments: z.boolean().optional().default(true),
         include_csat: z.boolean().optional().default(true),
-
-        // Only turn this on if your account doesn’t provide solved_at/closed_at in search results
         include_resolved_audits: z.boolean().optional().default(false),
-
-        // Prevent huge payloads
         max_text_chars: z.number().int().min(200).max(5000).optional().default(2000),
       }),
     },
@@ -110,7 +107,7 @@ function createMcpServer() {
       const zd = zendeskClient();
       const runLimited = limiter(6);
 
-      // Date cutoff for Zendesk Search API
+      // date cutoff for Zendesk search
       const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
       const yyyy = since.getUTCFullYear();
       const mm = String(since.getUTCMonth() + 1).padStart(2, '0');
@@ -124,7 +121,7 @@ function createMcpServer() {
 
       const rawTickets = search.results || [];
 
-      // Batch fetch assignee names
+      // batch fetch agent names
       const assigneeIds = Array.from(
         new Set(rawTickets.map((t) => t.assignee_id).filter(Boolean))
       );
@@ -153,10 +150,10 @@ function createMcpServer() {
               ? agentNameById[t.assignee_id] || null
               : null;
 
-            // resolved_at
+            // resolved_at: prefer solved_at / closed_at if present
             let resolved_at = t.solved_at || t.closed_at || null;
 
-            // Optional audits fallback
+            // optional audits fallback
             if (!resolved_at && include_resolved_audits) {
               const audits = await safeGet(
                 zd,
@@ -188,17 +185,17 @@ function createMcpServer() {
               }
             }
 
-            // csat_score
+            // csat_score ("good" | "bad" | null)
             let csat_score = null;
             if (include_csat) {
               const csat = await safeGet(
                 zd,
                 `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`
               );
-              csat_score = csat?.satisfaction_rating?.score || null; // "good" | "bad" | null
+              csat_score = csat?.satisfaction_rating?.score || null;
             }
 
-            // user_message / agent_response
+            // user_message / agent_response from comments
             let user_message = null;
             let agent_response = null;
 
@@ -215,18 +212,18 @@ function createMcpServer() {
                 const body = (c.body || '').trim();
                 if (!body) continue;
 
-                if (requester_id && c.author_id === requester_id) {
-                  userParts.push(body);
-                } else {
-                  agentParts.push(body);
-                }
+                // requester = customer; others = agent/admin
+                if (requester_id && c.author_id === requester_id) userParts.push(body);
+                else agentParts.push(body);
               }
 
-              user_message = userParts.join('\n\n---\n\n').slice(0, max_text_chars) || null;
-              agent_response = agentParts.join('\n\n---\n\n').slice(0, max_text_chars) || null;
+              user_message =
+                userParts.join('\n\n---\n\n').slice(0, max_text_chars) || null;
+              agent_response =
+                agentParts.join('\n\n---\n\n').slice(0, max_text_chars) || null;
             }
 
-            // Return EXACT schema fields required by your skill spec
+            // EXACT required schema
             return {
               ticket_id,
               created_at,
@@ -256,27 +253,48 @@ function createMcpServer() {
   return server;
 }
 
-// Global server instance (stable)
-const mcpServer = createMcpServer();
+// ---- Sessions: sessionId -> { server, transport, lastSeen } ----
+const sessions = new Map();
 
-// Session-aware transports (so Claude can do proper handshake + tool discovery)
-const transportsBySession = new Map();
+// Optional cleanup (10 minutes idle)
+const SESSION_TTL_MS = 10 * 60 * 1000;
 
-function getOrCreateTransport(sessionId) {
-  let transport = transportsBySession.get(sessionId);
-  if (!transport) {
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => sessionId,
-      enableJsonResponse: true,
-    });
-    transportsBySession.set(sessionId, transport);
-    // Connect server once per new transport
-    mcpServer.connect(transport).catch((e) => {
-      console.error('MCP connect error:', e);
-      transportsBySession.delete(sessionId);
-    });
+function cleanupSessions() {
+  const now = Date.now();
+  for (const [sessionId, s] of sessions.entries()) {
+    if (now - s.lastSeen > SESSION_TTL_MS) {
+      try {
+        s.transport.close();
+      } catch {}
+      try {
+        s.server.close();
+      } catch {}
+      sessions.delete(sessionId);
+    }
   }
-  return transport;
+}
+setInterval(cleanupSessions, 60 * 1000).unref();
+
+async function getOrCreateSession(sessionId) {
+  const existing = sessions.get(sessionId);
+  if (existing) {
+    existing.lastSeen = Date.now();
+    return existing;
+  }
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => sessionId,
+    enableJsonResponse: true,
+  });
+
+  const server = createMcpServer();
+
+  // Connect once for this session
+  await server.connect(transport);
+
+  const session = { server, transport, lastSeen: Date.now() };
+  sessions.set(sessionId, session);
+  return session;
 }
 
 // ---- HTTP app ----
@@ -285,23 +303,16 @@ app.use(express.json({ limit: '2mb' }));
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// MCP endpoint
 app.post('/mcp', async (req, res) => {
   try {
-    // Use session header if present; otherwise generate a stable id for this request
+    // Claude may or may not send a session header; create one if absent
     const sessionId =
       req.headers['mcp-session-id']?.toString() ||
       req.headers['x-mcp-session-id']?.toString() ||
       randomUUID();
 
-    const transport = getOrCreateTransport(sessionId);
-    await transport.handleRequest(req, res, req.body);
-
-    // Cleanup when client closes (optional; you can keep sessions longer)
-    res.on('close', () => {
-      // Keep it simple: don’t delete immediately; avoids flakiness on reconnects.
-      // If you want TTL cleanup later, we can add it.
-    });
+    const session = await getOrCreateSession(sessionId);
+    await session.transport.handleRequest(req, res, req.body);
   } catch (err) {
     console.error('MCP request error:', err);
     if (!res.headersSent) {
