@@ -9,6 +9,9 @@ import { z } from 'zod';
 
 const PORT = process.env.PORT || 3000;
 
+// ✅ Shared secret gate (Claude-friendly via URL query param ?secret=...)
+const MCP_SHARED_SECRET = process.env.MCP_SHARED_SECRET?.trim() || '';
+
 // Zendesk env vars
 const ZENDESK_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN?.trim() || '';
 const ZENDESK_EMAIL = process.env.ZENDESK_EMAIL?.trim() || '';
@@ -29,7 +32,7 @@ function zendeskClient() {
       username: `${ZENDESK_EMAIL}/token`,
       password: ZENDESK_API_TOKEN,
     },
-    timeout: 25000,
+    timeout: 30000,
   });
 }
 
@@ -59,14 +62,112 @@ function limiter(max = 6) {
   };
 }
 
+function truncate(s, maxChars) {
+  if (!s) return null;
+  const t = String(s);
+  return t.length <= maxChars ? t : t.slice(0, maxChars) + '…';
+}
+
+function computeResolutionHours(created_at, resolved_at) {
+  if (!created_at || !resolved_at) return null;
+  const ms = new Date(resolved_at).getTime() - new Date(created_at).getTime();
+  if (Number.isNaN(ms) || ms < 0) return null;
+  return Math.round((ms / 3600000) * 10) / 10;
+}
+
+async function resolveResolvedAt({
+  zd,
+  ticket_id,
+  created_at,
+  solved_at,
+  closed_at,
+  include_resolved_audits,
+}) {
+  let resolved_at = solved_at || closed_at || null;
+
+  if (!resolved_at && include_resolved_audits) {
+    const audits = await safeGet(zd, `/api/v2/tickets/${ticket_id}/audits.json`);
+    if (audits?.audits?.length) {
+      for (const a of audits.audits) {
+        const events = a.events || [];
+        const statusChange = events.find(
+          (e) =>
+            e.field_name === 'status' &&
+            (e.value === 'solved' || e.value === 'closed')
+        );
+        if (statusChange) {
+          resolved_at = a.created_at;
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    resolved_at,
+    resolution_time_hrs: computeResolutionHours(created_at, resolved_at),
+  };
+}
+
+async function buildMessagesFromComments({
+  zd,
+  ticket_id,
+  requester_id,
+  max_text_chars,
+  include_author_map,
+}) {
+  const comments = await safeGet(zd, `/api/v2/tickets/${ticket_id}/comments.json`);
+  const commentList = comments?.comments || [];
+
+  let authorNameById = {};
+  if (include_author_map) {
+    const authorIds = Array.from(
+      new Set(commentList.map((c) => c.author_id).filter(Boolean))
+    );
+    if (authorIds.length) {
+      const users = await safeGet(zd, '/api/v2/users/show_many.json', {
+        ids: authorIds.join(','),
+      });
+      for (const u of users?.users || []) authorNameById[u.id] = u.name;
+    }
+  }
+
+  const userParts = [];
+  const agentParts = [];
+  const thread = [];
+
+  for (const c of commentList) {
+    const body = (c.body || '').trim();
+    if (!body) continue;
+
+    const isUser = requester_id && c.author_id === requester_id;
+    if (isUser) userParts.push(body);
+    else agentParts.push(body);
+
+    thread.push({
+      author_id: c.author_id,
+      author_name: include_author_map ? authorNameById[c.author_id] || null : null,
+      is_customer: Boolean(isUser),
+      created_at: c.created_at || null,
+      body: truncate(body, max_text_chars),
+      public: c.public ?? true,
+    });
+  }
+
+  return {
+    user_message: truncate(userParts.join('\n\n---\n\n'), max_text_chars),
+    agent_response: truncate(agentParts.join('\n\n---\n\n'), max_text_chars),
+    thread,
+  };
+}
+
 // ---- MCP server factory (NEW SERVER PER SESSION) ----
 function createMcpServer() {
   const server = new McpServer(
-    { name: 'zendesk-readonly-mcp', version: '1.0.0' },
+    { name: 'zendesk-readonly-mcp', version: '2.0.0' },
     { capabilities: { logging: {} } }
   );
 
-  // ping (debug)
   server.registerTool(
     'ping',
     {
@@ -80,25 +181,45 @@ function createMcpServer() {
   );
 
   /**
-   * list_tickets (your required schema)
+   * ✅ list_tickets via Incremental Tickets Export
+   * Best for "ALL tickets since 2026-01-01"
+   *
+   * Returns your normalized schema:
+   * ticket_id, created_at, resolved_at, status, priority, channel, tags, subject,
+   * user_message, agent_response, csat_score, agent_name, resolution_time_hrs
+   *
+   * For large pulls, keep include_comments/include_csat false and use get_ticket for deep dives.
    */
   server.registerTool(
     'list_tickets',
     {
       description:
-        'List Zendesk tickets from the last N days, normalized for CX analysis.',
+        'List Zendesk tickets using Incremental Export (best for large date ranges), normalized for CX analysis.',
       inputSchema: z.object({
-        days: z.number().int().min(1).max(30).optional().default(7),
-        per_page: z.number().int().min(1).max(100).optional().default(50),
-        include_comments: z.boolean().optional().default(true),
-        include_csat: z.boolean().optional().default(true),
+        start_date: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .optional()
+          .default('2026-01-01')
+          .describe('YYYY-MM-DD (defaults to 2026-01-01)'),
+        end_date: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .optional()
+          .describe('YYYY-MM-DD (optional)'),
+        max_tickets: z.number().int().min(1).max(200000).optional().default(20000),
+
+        include_comments: z.boolean().optional().default(false),
+        include_csat: z.boolean().optional().default(false),
+
         include_resolved_audits: z.boolean().optional().default(false),
         max_text_chars: z.number().int().min(200).max(5000).optional().default(2000),
       }),
     },
     async ({
-      days,
-      per_page,
+      start_date,
+      end_date,
+      max_tickets,
       include_comments,
       include_csat,
       include_resolved_audits,
@@ -107,25 +228,43 @@ function createMcpServer() {
       const zd = zendeskClient();
       const runLimited = limiter(6);
 
-      // date cutoff for Zendesk search
-      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-      const yyyy = since.getUTCFullYear();
-      const mm = String(since.getUTCMonth() + 1).padStart(2, '0');
-      const dd = String(since.getUTCDate()).padStart(2, '0');
-      const sinceStr = `${yyyy}-${mm}-${dd}`;
+      const startUnix = Math.floor(new Date(`${start_date}T00:00:00Z`).getTime() / 1000);
+      if (!Number.isFinite(startUnix) || startUnix <= 0) {
+        throw new Error('Invalid start_date. Use YYYY-MM-DD.');
+      }
 
-      const query = `type:ticket created>${sinceStr}`;
-      const { data: search } = await zd.get('/api/v2/search.json', {
-        params: { query, per_page, sort_by: 'created_at', sort_order: 'desc' },
-      });
+      const endMs = end_date ? new Date(`${end_date}T23:59:59Z`).getTime() : null;
 
-      const rawTickets = search.results || [];
+      let nextUrl = `/api/v2/incremental/tickets.json?start_time=${startUnix}`;
+      const collected = [];
 
-      // batch fetch agent names
-      const assigneeIds = Array.from(
-        new Set(rawTickets.map((t) => t.assignee_id).filter(Boolean))
-      );
+      while (nextUrl && collected.length < max_tickets) {
+        const resp = nextUrl.startsWith('http')
+          ? await zd.get(nextUrl, { baseURL: '' })
+          : await zd.get(nextUrl);
 
+        const data = resp.data;
+        const batch = data.tickets || [];
+
+        for (const t of batch) {
+          if (endMs) {
+            const createdMs = new Date(t.created_at).getTime();
+            if (!Number.isNaN(createdMs) && createdMs > endMs) {
+              nextUrl = null; // stop outer loop
+              break;
+            }
+          }
+          collected.push(t);
+          if (collected.length >= max_tickets) break;
+        }
+
+        if (!nextUrl) break;
+        if (data.end_of_stream) break;
+        nextUrl = data.next_page || null;
+      }
+
+      // Batch fetch agent names
+      const assigneeIds = Array.from(new Set(collected.map((t) => t.assignee_id).filter(Boolean)));
       const agentNameById = {};
       if (assigneeIds.length) {
         const users = await safeGet(zd, '/api/v2/users/show_many.json', {
@@ -135,7 +274,7 @@ function createMcpServer() {
       }
 
       const tickets = await Promise.all(
-        rawTickets.map((t) =>
+        collected.map((t) =>
           runLimited(async () => {
             const ticket_id = t.id;
             const created_at = t.created_at;
@@ -145,85 +284,37 @@ function createMcpServer() {
             const tags = t.tags || [];
             const subject = t.subject || '';
             const requester_id = t.requester_id || null;
+            const agent_name = t.assignee_id ? agentNameById[t.assignee_id] || null : null;
 
-            const agent_name = t.assignee_id
-              ? agentNameById[t.assignee_id] || null
-              : null;
+            const { resolved_at, resolution_time_hrs } = await resolveResolvedAt({
+              zd,
+              ticket_id,
+              created_at,
+              solved_at: t.solved_at,
+              closed_at: t.closed_at,
+              include_resolved_audits,
+            });
 
-            // resolved_at: prefer solved_at / closed_at if present
-            let resolved_at = t.solved_at || t.closed_at || null;
-
-            // optional audits fallback
-            if (!resolved_at && include_resolved_audits) {
-              const audits = await safeGet(
-                zd,
-                `/api/v2/tickets/${ticket_id}/audits.json`
-              );
-              if (audits?.audits?.length) {
-                for (const a of audits.audits) {
-                  const events = a.events || [];
-                  const statusChange = events.find(
-                    (e) =>
-                      e.field_name === 'status' &&
-                      (e.value === 'solved' || e.value === 'closed')
-                  );
-                  if (statusChange) {
-                    resolved_at = a.created_at;
-                    break;
-                  }
-                }
-              }
-            }
-
-            // resolution_time_hrs
-            let resolution_time_hrs = null;
-            if (resolved_at && created_at) {
-              const ms =
-                new Date(resolved_at).getTime() - new Date(created_at).getTime();
-              if (!Number.isNaN(ms) && ms >= 0) {
-                resolution_time_hrs = Math.round((ms / 3600000) * 10) / 10;
-              }
-            }
-
-            // csat_score ("good" | "bad" | null)
             let csat_score = null;
             if (include_csat) {
-              const csat = await safeGet(
-                zd,
-                `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`
-              );
-              csat_score = csat?.satisfaction_rating?.score || null;
+              const csat = await safeGet(zd, `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`);
+              csat_score = csat?.satisfaction_rating?.score || null; // "good" | "bad" | null
             }
 
-            // user_message / agent_response from comments
             let user_message = null;
             let agent_response = null;
-
             if (include_comments) {
-              const comments = await safeGet(
+              const msg = await buildMessagesFromComments({
                 zd,
-                `/api/v2/tickets/${ticket_id}/comments.json`
-              );
-
-              const userParts = [];
-              const agentParts = [];
-
-              for (const c of comments?.comments || []) {
-                const body = (c.body || '').trim();
-                if (!body) continue;
-
-                // requester = customer; others = agent/admin
-                if (requester_id && c.author_id === requester_id) userParts.push(body);
-                else agentParts.push(body);
-              }
-
-              user_message =
-                userParts.join('\n\n---\n\n').slice(0, max_text_chars) || null;
-              agent_response =
-                agentParts.join('\n\n---\n\n').slice(0, max_text_chars) || null;
+                ticket_id,
+                requester_id,
+                max_text_chars,
+                include_author_map: false,
+              });
+              user_message = msg.user_message;
+              agent_response = msg.agent_response;
             }
 
-            // EXACT required schema
             return {
               ticket_id,
               created_at,
@@ -250,25 +341,115 @@ function createMcpServer() {
     }
   );
 
+  /**
+   * ✅ get_ticket(ticket_id) — full thread + CSAT + normalized fields
+   */
+  server.registerTool(
+    'get_ticket',
+    {
+      description:
+        'Get one Zendesk ticket with full conversation thread + CSAT; includes normalized fields.',
+      inputSchema: z.object({
+        ticket_id: z.number().int().describe('Zendesk ticket ID'),
+        include_csat: z.boolean().optional().default(true),
+        include_resolved_audits: z.boolean().optional().default(false),
+        max_text_chars: z.number().int().min(200).max(10000).optional().default(5000),
+      }),
+    },
+    async ({ ticket_id, include_csat, include_resolved_audits, max_text_chars }) => {
+      const zd = zendeskClient();
+
+      const tWrap = await safeGet(zd, `/api/v2/tickets/${ticket_id}.json`);
+      if (!tWrap?.ticket) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: 'Ticket not found' }) }],
+          structuredContent: { error: 'Ticket not found' },
+        };
+      }
+      const t = tWrap.ticket;
+
+      // agent name
+      let agent_name = null;
+      if (t.assignee_id) {
+        const u = await safeGet(zd, `/api/v2/users/${t.assignee_id}.json`);
+        agent_name = u?.user?.name || null;
+      }
+
+      const { resolved_at, resolution_time_hrs } = await resolveResolvedAt({
+        zd,
+        ticket_id,
+        created_at: t.created_at,
+        solved_at: t.solved_at,
+        closed_at: t.closed_at,
+        include_resolved_audits,
+      });
+
+      let csat_score = null;
+      let csat_detail = null;
+      if (include_csat) {
+        const csat = await safeGet(zd, `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`);
+        csat_score = csat?.satisfaction_rating?.score || null;
+        csat_detail = csat?.satisfaction_rating || null;
+      }
+
+      const msg = await buildMessagesFromComments({
+        zd,
+        ticket_id,
+        requester_id: t.requester_id || null,
+        max_text_chars,
+        include_author_map: true,
+      });
+
+      const normalized = {
+        ticket_id: t.id,
+        created_at: t.created_at,
+        resolved_at,
+        status: t.status,
+        priority: t.priority || 'normal',
+        channel: t.via?.channel || null,
+        tags: t.tags || [],
+        subject: t.subject || '',
+        user_message: msg.user_message,
+        agent_response: msg.agent_response,
+        csat_score,
+        agent_name,
+        resolution_time_hrs,
+      };
+
+      const output = {
+        normalized,
+        thread: msg.thread,
+        csat_detail,
+        zendesk: {
+          url: `https://${ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/${t.id}`,
+          assignee_id: t.assignee_id || null,
+          requester_id: t.requester_id || null,
+          group_id: t.group_id || null,
+          brand_id: t.brand_id || null,
+          updated_at: t.updated_at || null,
+        },
+      };
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+        structuredContent: output,
+      };
+    }
+  );
+
   return server;
 }
 
 // ---- Sessions: sessionId -> { server, transport, lastSeen } ----
 const sessions = new Map();
-
-// Optional cleanup (10 minutes idle)
 const SESSION_TTL_MS = 10 * 60 * 1000;
 
 function cleanupSessions() {
   const now = Date.now();
   for (const [sessionId, s] of sessions.entries()) {
     if (now - s.lastSeen > SESSION_TTL_MS) {
-      try {
-        s.transport.close();
-      } catch {}
-      try {
-        s.server.close();
-      } catch {}
+      try { s.transport.close(); } catch {}
+      try { s.server.close(); } catch {}
       sessions.delete(sessionId);
     }
   }
@@ -288,8 +469,6 @@ async function getOrCreateSession(sessionId) {
   });
 
   const server = createMcpServer();
-
-  // Connect once for this session
   await server.connect(transport);
 
   const session = { server, transport, lastSeen: Date.now() };
@@ -305,7 +484,18 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.post('/mcp', async (req, res) => {
   try {
-    // Claude may or may not send a session header; create one if absent
+    // ✅ Shared secret gate (URL param): /mcp?secret=...
+    if (MCP_SHARED_SECRET) {
+      const provided = (req.query?.secret || '').toString();
+      if (provided !== MCP_SHARED_SECRET) {
+        return res.status(401).json({
+          jsonrpc: '2.0',
+          error: { code: 401, message: 'Unauthorized' },
+          id: null,
+        });
+      }
+    }
+
     const sessionId =
       req.headers['mcp-session-id']?.toString() ||
       req.headers['x-mcp-session-id']?.toString() ||
@@ -332,4 +522,5 @@ app.get('/mcp', (req, res) =>
 app.listen(PORT, () => {
   console.log(`Zendesk MCP server listening on port ${PORT}`);
   console.log(`MCP endpoint: /mcp`);
+  console.log(`Shared secret gate: ${MCP_SHARED_SECRET ? 'ENABLED' : 'DISABLED'}`);
 });
