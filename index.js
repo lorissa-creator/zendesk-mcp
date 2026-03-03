@@ -9,7 +9,7 @@ import { z } from 'zod';
 
 const PORT = process.env.PORT || 3000;
 
-// ✅ Shared secret gate (Claude-friendly via URL query param ?secret=...)
+// ✅ Shared secret gate (Claude-friendly): /mcp?secret=...
 const MCP_SHARED_SECRET = process.env.MCP_SHARED_SECRET?.trim() || '';
 
 // Zendesk env vars
@@ -121,9 +121,7 @@ async function buildMessagesFromComments({
 
   let authorNameById = {};
   if (include_author_map) {
-    const authorIds = Array.from(
-      new Set(commentList.map((c) => c.author_id).filter(Boolean))
-    );
+    const authorIds = Array.from(new Set(commentList.map((c) => c.author_id).filter(Boolean)));
     if (authorIds.length) {
       const users = await safeGet(zd, '/api/v2/users/show_many.json', {
         ids: authorIds.join(','),
@@ -141,6 +139,7 @@ async function buildMessagesFromComments({
     if (!body) continue;
 
     const isUser = requester_id && c.author_id === requester_id;
+
     if (isUser) userParts.push(body);
     else agentParts.push(body);
 
@@ -161,10 +160,31 @@ async function buildMessagesFromComments({
   };
 }
 
+// Helper: paginate Zendesk Search API (for requester email)
+async function fetchAllSearch(zd, firstUrl, maxTickets = 500, pageLimit = 200) {
+  let nextUrl = firstUrl;
+  let pages = 0;
+  const results = [];
+
+  while (nextUrl && results.length < maxTickets && pages < pageLimit) {
+    pages++;
+
+    const resp = nextUrl.startsWith('http')
+      ? await zd.get(nextUrl, { baseURL: '' })
+      : await zd.get(nextUrl);
+
+    const data = resp.data;
+    results.push(...(data.results || []));
+    nextUrl = data.next_page || null;
+  }
+
+  return results.slice(0, maxTickets);
+}
+
 // ---- MCP server factory (NEW SERVER PER SESSION) ----
 function createMcpServer() {
   const server = new McpServer(
-    { name: 'zendesk-readonly-mcp', version: '2.0.0' },
+    { name: 'zendesk-readonly-mcp', version: '2.1.0' },
     { capabilities: { logging: {} } }
   );
 
@@ -181,14 +201,8 @@ function createMcpServer() {
   );
 
   /**
-   * ✅ list_tickets via Incremental Tickets Export
-   * Best for "ALL tickets since 2026-01-01"
-   *
-   * Returns your normalized schema:
-   * ticket_id, created_at, resolved_at, status, priority, channel, tags, subject,
-   * user_message, agent_response, csat_score, agent_name, resolution_time_hrs
-   *
-   * For large pulls, keep include_comments/include_csat false and use get_ticket for deep dives.
+   * ✅ list_tickets (Incremental Export)
+   * Default: start_date = 2026-01-01
    */
   server.registerTool(
     'list_tickets',
@@ -200,19 +214,14 @@ function createMcpServer() {
           .string()
           .regex(/^\d{4}-\d{2}-\d{2}$/)
           .optional()
-          .default('2026-01-01')
-          .describe('YYYY-MM-DD (defaults to 2026-01-01)'),
-        end_date: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
-          .optional()
-          .describe('YYYY-MM-DD (optional)'),
+          .default('2026-01-01'),
+        end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         max_tickets: z.number().int().min(1).max(200000).optional().default(20000),
 
         include_comments: z.boolean().optional().default(false),
         include_csat: z.boolean().optional().default(false),
-
         include_resolved_audits: z.boolean().optional().default(false),
+
         max_text_chars: z.number().int().min(200).max(5000).optional().default(2000),
       }),
     },
@@ -250,7 +259,7 @@ function createMcpServer() {
           if (endMs) {
             const createdMs = new Date(t.created_at).getTime();
             if (!Number.isNaN(createdMs) && createdMs > endMs) {
-              nextUrl = null; // stop outer loop
+              nextUrl = null;
               break;
             }
           }
@@ -284,6 +293,7 @@ function createMcpServer() {
             const tags = t.tags || [];
             const subject = t.subject || '';
             const requester_id = t.requester_id || null;
+
             const agent_name = t.assignee_id ? agentNameById[t.assignee_id] || null : null;
 
             const { resolved_at, resolution_time_hrs } = await resolveResolvedAt({
@@ -297,8 +307,11 @@ function createMcpServer() {
 
             let csat_score = null;
             if (include_csat) {
-              const csat = await safeGet(zd, `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`);
-              csat_score = csat?.satisfaction_rating?.score || null; // "good" | "bad" | null
+              const csat = await safeGet(
+                zd,
+                `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`
+              );
+              csat_score = csat?.satisfaction_rating?.score || null;
             }
 
             let user_message = null;
@@ -342,7 +355,164 @@ function createMcpServer() {
   );
 
   /**
-   * ✅ get_ticket(ticket_id) — full thread + CSAT + normalized fields
+   * ✅ search_tickets_by_requester_email (fast lookup via Search API)
+   */
+  server.registerTool(
+    'search_tickets_by_requester_email',
+    {
+      description:
+        'Search tickets for a requester email (fast). Returns normalized schema (optional comments/csat).',
+      inputSchema: z.object({
+        email: z.string().email(),
+        start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().default('2026-01-01'),
+        end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        per_page: z.number().int().min(1).max(100).optional().default(100),
+        max_tickets: z.number().int().min(1).max(5000).optional().default(500),
+
+        include_comments: z.boolean().optional().default(false),
+        include_csat: z.boolean().optional().default(false),
+        include_resolved_audits: z.boolean().optional().default(false),
+        max_text_chars: z.number().int().min(200).max(5000).optional().default(2000),
+      }),
+    },
+    async ({
+      email,
+      start_date,
+      end_date,
+      per_page,
+      max_tickets,
+      include_comments,
+      include_csat,
+      include_resolved_audits,
+      max_text_chars,
+    }) => {
+      const zd = zendeskClient();
+      const runLimited = limiter(6);
+
+      // 1) Find user by email
+      const userSearch = await safeGet(zd, '/api/v2/users/search.json', {
+        query: `email:${email}`,
+      });
+      const user = (userSearch?.users || [])[0];
+      if (!user?.id) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                { requester: { email }, tickets: [], note: 'No requester found for email.' },
+                null,
+                2
+              ),
+            },
+          ],
+          structuredContent: {
+            requester: { email },
+            tickets: [],
+            note: 'No requester found for email.',
+          },
+        };
+      }
+
+      const requesterId = user.id;
+
+      // 2) Search tickets by requester_id (paginate)
+      let query = `type:ticket requester_id:${requesterId}`;
+      if (start_date) query += ` created>=${start_date}`;
+      if (end_date) query += ` created<=${end_date}`;
+
+      const firstUrl = `/api/v2/search.json?${new URLSearchParams({
+        query,
+        per_page: String(per_page),
+        sort_by: 'created_at',
+        sort_order: 'desc',
+      }).toString()}`;
+
+      const rawTickets = await fetchAllSearch(zd, firstUrl, max_tickets, 200);
+
+      // Batch fetch agent names
+      const assigneeIds = Array.from(new Set(rawTickets.map((t) => t.assignee_id).filter(Boolean)));
+      const agentNameById = {};
+      if (assigneeIds.length) {
+        const usersMany = await safeGet(zd, '/api/v2/users/show_many.json', {
+          ids: assigneeIds.join(','),
+        });
+        for (const u of usersMany?.users || []) agentNameById[u.id] = u.name;
+      }
+
+      const tickets = await Promise.all(
+        rawTickets.map((t) =>
+          runLimited(async () => {
+            const ticket_id = t.id;
+            const created_at = t.created_at;
+            const status = t.status;
+            const priority = t.priority || 'normal';
+            const channel = t.via?.channel || null;
+            const tags = t.tags || [];
+            const subject = t.subject || '';
+
+            const agent_name = t.assignee_id ? agentNameById[t.assignee_id] || null : null;
+
+            const { resolved_at, resolution_time_hrs } = await resolveResolvedAt({
+              zd,
+              ticket_id,
+              created_at,
+              solved_at: t.solved_at,
+              closed_at: t.closed_at,
+              include_resolved_audits,
+            });
+
+            let csat_score = null;
+            if (include_csat) {
+              const csat = await safeGet(
+                zd,
+                `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`
+              );
+              csat_score = csat?.satisfaction_rating?.score || null;
+            }
+
+            let user_message = null;
+            let agent_response = null;
+            if (include_comments) {
+              const msg = await buildMessagesFromComments({
+                zd,
+                ticket_id,
+                requester_id: requesterId,
+                max_text_chars,
+                include_author_map: false,
+              });
+              user_message = msg.user_message;
+              agent_response = msg.agent_response;
+            }
+
+            return {
+              ticket_id,
+              created_at,
+              resolved_at,
+              status,
+              priority,
+              channel,
+              tags,
+              subject,
+              user_message,
+              agent_response,
+              csat_score,
+              agent_name,
+              resolution_time_hrs,
+            };
+          })
+        )
+      );
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ requester: { id: requesterId, email }, tickets }, null, 2) }],
+        structuredContent: { requester: { id: requesterId, email }, tickets },
+      };
+    }
+  );
+
+  /**
+   * ✅ get_ticket(ticket_id) — deep dive: full thread + CSAT
    */
   server.registerTool(
     'get_ticket',
@@ -350,7 +520,7 @@ function createMcpServer() {
       description:
         'Get one Zendesk ticket with full conversation thread + CSAT; includes normalized fields.',
       inputSchema: z.object({
-        ticket_id: z.number().int().describe('Zendesk ticket ID'),
+        ticket_id: z.number().int(),
         include_csat: z.boolean().optional().default(true),
         include_resolved_audits: z.boolean().optional().default(false),
         max_text_chars: z.number().int().min(200).max(10000).optional().default(5000),
@@ -362,13 +532,13 @@ function createMcpServer() {
       const tWrap = await safeGet(zd, `/api/v2/tickets/${ticket_id}.json`);
       if (!tWrap?.ticket) {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ error: 'Ticket not found' }) }],
+          content: [{ type: 'text', text: JSON.stringify({ error: 'Ticket not found' }, null, 2) }],
           structuredContent: { error: 'Ticket not found' },
         };
       }
+
       const t = tWrap.ticket;
 
-      // agent name
       let agent_name = null;
       if (t.assignee_id) {
         const u = await safeGet(zd, `/api/v2/users/${t.assignee_id}.json`);
