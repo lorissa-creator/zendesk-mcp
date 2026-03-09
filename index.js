@@ -45,7 +45,6 @@ async function safeGet(zd, url, params) {
   }
 }
 
-// Concurrency limiter (helps avoid Zendesk rate limits)
 function limiter(max = 6) {
   let active = 0;
   const queue = [];
@@ -68,6 +67,13 @@ function truncate(s, maxChars) {
   return t.length <= maxChars ? t : t.slice(0, maxChars) + '…';
 }
 
+function minutesToHours(mins) {
+  if (mins == null) return null;
+  const n = Number(mins);
+  if (!Number.isFinite(n)) return null;
+  return Math.round((n / 60) * 10) / 10;
+}
+
 function computeResolutionHours(created_at, resolved_at) {
   if (!created_at || !resolved_at) return null;
   const ms = new Date(resolved_at).getTime() - new Date(created_at).getTime();
@@ -75,14 +81,7 @@ function computeResolutionHours(created_at, resolved_at) {
   return Math.round((ms / 3600000) * 10) / 10;
 }
 
-async function resolveResolvedAt({
-  zd,
-  ticket_id,
-  created_at,
-  solved_at,
-  closed_at,
-  include_resolved_audits,
-}) {
+async function resolveResolvedAt({ zd, ticket_id, created_at, solved_at, closed_at, include_resolved_audits }) {
   let resolved_at = solved_at || closed_at || null;
 
   if (!resolved_at && include_resolved_audits) {
@@ -109,66 +108,79 @@ async function resolveResolvedAt({
   };
 }
 
-async function buildMessagesFromComments({
-  zd,
-  ticket_id,
-  requester_id,
-  max_text_chars,
-  include_author_map,
-}) {
-  const comments = await safeGet(zd, `/api/v2/tickets/${ticket_id}/comments.json`);
-  const commentList = comments?.comments || [];
+async function getTicketMetrics(zd, ticket_id) {
+  // Zendesk Ticket Metrics endpoint
+  const m = await safeGet(zd, `/api/v2/tickets/${ticket_id}/metrics.json`);
+  const metrics = m?.ticket_metric;
+  if (!metrics) return null;
 
-  let authorNameById = {};
-  if (include_author_map) {
-    const authorIds = Array.from(new Set(commentList.map((c) => c.author_id).filter(Boolean)));
-    if (authorIds.length) {
-      const users = await safeGet(zd, '/api/v2/users/show_many.json', {
-        ids: authorIds.join(','),
-      });
-      for (const u of users?.users || []) authorNameById[u.id] = u.name;
-    }
-  }
-
-  const userParts = [];
-  const agentParts = [];
-  const thread = [];
-
-  for (const c of commentList) {
-    const body = (c.body || '').trim();
-    if (!body) continue;
-
-    const isUser = requester_id && c.author_id === requester_id;
-
-    if (isUser) userParts.push(body);
-    else agentParts.push(body);
-
-    thread.push({
-      author_id: c.author_id,
-      author_name: include_author_map ? authorNameById[c.author_id] || null : null,
-      is_customer: Boolean(isUser),
-      created_at: c.created_at || null,
-      body: truncate(body, max_text_chars),
-      public: c.public ?? true,
-    });
-  }
+  const firstReplyMin = metrics.first_reply_time_in_minutes?.calendar ?? null;
+  const replyTimeMin = metrics.reply_time_in_minutes?.calendar ?? null;
+  const fullResMin = metrics.full_resolution_time_in_minutes?.calendar ?? null;
 
   return {
-    user_message: truncate(userParts.join('\n\n---\n\n'), max_text_chars),
-    agent_response: truncate(agentParts.join('\n\n---\n\n'), max_text_chars),
-    thread,
+    first_reply_time_mins: firstReplyMin,
+    reply_time_mins: replyTimeMin,
+    resolution_time_mins: fullResMin,
+    resolution_time_hrs_from_metrics: minutesToHours(fullResMin),
   };
 }
 
-// Helper: paginate Zendesk Search API (for requester email)
-async function fetchAllSearch(zd, firstUrl, maxTickets = 500, pageLimit = 200) {
+async function getCсатScore(zd, ticket_id) {
+  const csat = await safeGet(zd, `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`);
+  return csat?.satisfaction_rating?.score || null; // "good" | "bad" | null
+}
+
+function parseTicketSource(t) {
+  const channel = t?.via?.channel || null;
+  const source = t?.via?.source || null;
+
+  // Keep this general: it varies by channel
+  // Examples: source.from.address (email), source.from.phone, source.rel, etc.
+  return {
+    channel,
+    via: source ? source : null,
+  };
+}
+
+async function buildPublicPrivateComments({ zd, ticket_id, max_text_chars }) {
+  const comments = await safeGet(zd, `/api/v2/tickets/${ticket_id}/comments.json`);
+  const list = comments?.comments || [];
+
+  const pub = [];
+  const priv = [];
+
+  for (const c of list) {
+    const body = (c.body || '').trim();
+    if (!body) continue;
+
+    if (c.public) pub.push(body);
+    else priv.push(body);
+  }
+
+  return {
+    public_comments: truncate(pub.join('\n\n---\n\n'), max_text_chars),
+    private_comments: truncate(priv.join('\n\n---\n\n'), max_text_chars),
+  };
+}
+
+async function fetchUsersByIds(zd, ids) {
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  if (!unique.length) return {};
+  const users = await safeGet(zd, '/api/v2/users/show_many.json', { ids: unique.join(',') });
+  const map = {};
+  for (const u of users?.users || []) map[u.id] = u;
+  return map;
+}
+
+// Helper: paginate Zendesk Search API
+async function fetchAllSearch(zd, firstUrl, maxTickets = 1000, pageLimit = 200) {
   let nextUrl = firstUrl;
   let pages = 0;
   const results = [];
 
   while (nextUrl && results.length < maxTickets && pages < pageLimit) {
     pages++;
-
     const resp = nextUrl.startsWith('http')
       ? await zd.get(nextUrl, { baseURL: '' })
       : await zd.get(nextUrl);
@@ -181,10 +193,61 @@ async function fetchAllSearch(zd, firstUrl, maxTickets = 500, pageLimit = 200) {
   return results.slice(0, maxTickets);
 }
 
+function buildNormalizedRecord({
+  t,
+  requester,
+  submitter,
+  assignee,
+  csat_score,
+  metrics,
+  resolved_at,
+  resolution_time_hrs,
+  commentBlobs,
+}) {
+  const { channel, via } = parseTicketSource(t);
+
+  return {
+    ticket_id: t.id,
+    created_at: t.created_at || null,
+    closed_at: t.closed_at || null,
+    resolved_at: resolved_at || t.solved_at || t.closed_at || null,
+
+    status: t.status || null,
+    priority: t.priority || 'normal',
+
+    tags: t.tags || [],
+    subject: t.subject || '',
+
+    requester_email: requester?.email || null,
+    submitter_name: submitter?.name || null,
+    agent_name: assignee?.name || null,
+
+    // Times
+    first_reply_time_mins: metrics?.first_reply_time_mins ?? null,
+    reply_time_mins: metrics?.reply_time_mins ?? null,
+    resolution_time_mins: metrics?.resolution_time_mins ?? null,
+
+    // keep the originally computed hrs too
+    resolution_time_hrs: resolution_time_hrs ?? null,
+    resolution_time_hrs_from_metrics: metrics?.resolution_time_hrs_from_metrics ?? null,
+
+    // CSAT
+    csat_score: csat_score || null,
+
+    // Comments
+    public_comment: commentBlobs?.public_comments ?? null,
+    private_comment: commentBlobs?.private_comments ?? null,
+
+    // Source
+    channel,
+    ticket_source: via, // raw via.source object
+  };
+}
+
 // ---- MCP server factory (NEW SERVER PER SESSION) ----
 function createMcpServer() {
   const server = new McpServer(
-    { name: 'zendesk-readonly-mcp', version: '2.1.0' },
+    { name: 'zendesk-readonly-mcp', version: '3.0.0' },
     { capabilities: { logging: {} } }
   );
 
@@ -201,46 +264,58 @@ function createMcpServer() {
   );
 
   /**
-   * ✅ list_tickets (Incremental Export)
-   * Default: start_date = 2026-01-01
+   * ✅ list_tickets_since (Incremental Export, defaults to 2026-01-01)
+   * Can optionally include csat/metrics/comments and filter for “bad csat” or “resolution > X hrs”.
    */
   server.registerTool(
-    'list_tickets',
+    'list_tickets_since',
     {
       description:
-        'List Zendesk tickets using Incremental Export (best for large date ranges), normalized for CX analysis.',
+        'List tickets since start_date (default 2026-01-01) via Incremental Export. Optional enrichment: csat, metrics, comments; optional filtering: bad CSAT, resolution > X hours.',
       inputSchema: z.object({
-        start_date: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
-          .optional()
-          .default('2026-01-01'),
+        start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().default('2026-01-01'),
         end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         max_tickets: z.number().int().min(1).max(200000).optional().default(20000),
 
+        include_csat: z.boolean().optional().default(true),
+        include_metrics: z.boolean().optional().default(true),
         include_comments: z.boolean().optional().default(false),
-        include_csat: z.boolean().optional().default(false),
-        include_resolved_audits: z.boolean().optional().default(false),
 
-        max_text_chars: z.number().int().min(200).max(5000).optional().default(2000),
+        include_resolved_audits: z.boolean().optional().default(false),
+        max_text_chars: z.number().int().min(200).max(10000).optional().default(5000),
+
+        // Filters
+        channel: z.string().optional(), // email/chat/phone/web/social...
+        tag: z.string().optional(),
+        status: z.string().optional(),
+        agent_name_contains: z.string().optional(), // simple agent filter after lookup
+        only_bad_csat: z.boolean().optional().default(false),
+        resolution_time_gt_hrs: z.number().min(0).optional(), // uses metrics if present, else resolved timestamps
       }),
     },
-    async ({
-      start_date,
-      end_date,
-      max_tickets,
-      include_comments,
-      include_csat,
-      include_resolved_audits,
-      max_text_chars,
-    }) => {
+    async (args) => {
+      const {
+        start_date,
+        end_date,
+        max_tickets,
+        include_csat,
+        include_metrics,
+        include_comments,
+        include_resolved_audits,
+        max_text_chars,
+        channel,
+        tag,
+        status,
+        agent_name_contains,
+        only_bad_csat,
+        resolution_time_gt_hrs,
+      } = args;
+
       const zd = zendeskClient();
       const runLimited = limiter(6);
 
       const startUnix = Math.floor(new Date(`${start_date}T00:00:00Z`).getTime() / 1000);
-      if (!Number.isFinite(startUnix) || startUnix <= 0) {
-        throw new Error('Invalid start_date. Use YYYY-MM-DD.');
-      }
+      if (!Number.isFinite(startUnix) || startUnix <= 0) throw new Error('Invalid start_date. Use YYYY-MM-DD.');
 
       const endMs = end_date ? new Date(`${end_date}T23:59:59Z`).getTime() : null;
 
@@ -263,6 +338,12 @@ function createMcpServer() {
               break;
             }
           }
+
+          // cheap filters (no extra API calls)
+          if (status && t.status !== status) continue;
+          if (channel && (t?.via?.channel || null) !== channel) continue;
+          if (tag && !(t.tags || []).includes(tag)) continue;
+
           collected.push(t);
           if (collected.length >= max_tickets) break;
         }
@@ -272,154 +353,117 @@ function createMcpServer() {
         nextUrl = data.next_page || null;
       }
 
-      // Batch fetch agent names
-      const assigneeIds = Array.from(new Set(collected.map((t) => t.assignee_id).filter(Boolean)));
-      const agentNameById = {};
-      if (assigneeIds.length) {
-        const users = await safeGet(zd, '/api/v2/users/show_many.json', {
-          ids: assigneeIds.join(','),
-        });
-        for (const u of users?.users || []) agentNameById[u.id] = u.name;
-      }
+      // Batch user fetch (requester, submitter, assignee)
+      const requesterIds = collected.map((t) => t.requester_id).filter(Boolean);
+      const submitterIds = collected.map((t) => t.submitter_id).filter(Boolean);
+      const assigneeIds = collected.map((t) => t.assignee_id).filter(Boolean);
+      const userMap = await fetchUsersByIds(zd, [...requesterIds, ...submitterIds, ...assigneeIds]);
 
       const tickets = await Promise.all(
         collected.map((t) =>
           runLimited(async () => {
             const ticket_id = t.id;
-            const created_at = t.created_at;
-            const status = t.status;
-            const priority = t.priority || 'normal';
-            const channel = t.via?.channel || null;
-            const tags = t.tags || [];
-            const subject = t.subject || '';
-            const requester_id = t.requester_id || null;
 
-            const agent_name = t.assignee_id ? agentNameById[t.assignee_id] || null : null;
+            const requester = userMap[t.requester_id] || null;
+            const submitter = userMap[t.submitter_id] || null;
+            const assignee = userMap[t.assignee_id] || null;
+
+            if (agent_name_contains) {
+              const nm = (assignee?.name || '').toLowerCase();
+              if (!nm.includes(agent_name_contains.toLowerCase())) {
+                return null;
+              }
+            }
 
             const { resolved_at, resolution_time_hrs } = await resolveResolvedAt({
               zd,
               ticket_id,
-              created_at,
+              created_at: t.created_at,
               solved_at: t.solved_at,
               closed_at: t.closed_at,
               include_resolved_audits,
             });
 
-            let csat_score = null;
-            if (include_csat) {
-              const csat = await safeGet(
-                zd,
-                `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`
-              );
-              csat_score = csat?.satisfaction_rating?.score || null;
+            const csat_score = include_csat ? await getCсатScore(zd, ticket_id) : null;
+            if (only_bad_csat && csat_score !== 'bad') return null;
+
+            const metrics = include_metrics ? await getTicketMetrics(zd, ticket_id) : null;
+
+            // resolution time filter (prefer metrics.full_resolution_time_in_minutes.calendar)
+            if (resolution_time_gt_hrs != null) {
+              const hrsFromMetrics = metrics?.resolution_time_hrs_from_metrics ?? null;
+              const hrsFallback = resolution_time_hrs ?? null;
+              const hrs = hrsFromMetrics ?? hrsFallback;
+
+              if (hrs == null || hrs <= resolution_time_gt_hrs) return null;
             }
 
-            let user_message = null;
-            let agent_response = null;
-            if (include_comments) {
-              const msg = await buildMessagesFromComments({
-                zd,
-                ticket_id,
-                requester_id,
-                max_text_chars,
-                include_author_map: false,
-              });
-              user_message = msg.user_message;
-              agent_response = msg.agent_response;
-            }
+            const commentBlobs = include_comments
+              ? await buildPublicPrivateComments({ zd, ticket_id, max_text_chars })
+              : { public_comments: null, private_comments: null };
 
-            return {
-              ticket_id,
-              created_at,
-              resolved_at,
-              status,
-              priority,
-              channel,
-              tags,
-              subject,
-              user_message,
-              agent_response,
+            return buildNormalizedRecord({
+              t,
+              requester,
+              submitter,
+              assignee,
               csat_score,
-              agent_name,
+              metrics,
+              resolved_at,
               resolution_time_hrs,
-            };
+              commentBlobs,
+            });
           })
         )
       );
 
+      const cleaned = tickets.filter(Boolean);
+
       return {
-        content: [{ type: 'text', text: JSON.stringify({ tickets }, null, 2) }],
-        structuredContent: { tickets },
+        content: [{ type: 'text', text: JSON.stringify({ tickets: cleaned }, null, 2) }],
+        structuredContent: { tickets: cleaned },
       };
     }
   );
 
   /**
-   * ✅ search_tickets_by_requester_email (fast lookup via Search API)
+   * ✅ search_tickets (Search API) — best for fast filters: channel/tag/agent/email
    */
   server.registerTool(
-    'search_tickets_by_requester_email',
+    'search_tickets',
     {
       description:
-        'Search tickets for a requester email (fast). Returns normalized schema (optional comments/csat).',
+        'Fast Zendesk ticket search (Search API). Use this for tag/channel/agent/email filtering without pulling everything.',
       inputSchema: z.object({
-        email: z.string().email(),
-        start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().default('2026-01-01'),
-        end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        query: z.string().min(1).describe('Zendesk search query (e.g. type:ticket tags:refund created>=2026-01-01)'),
         per_page: z.number().int().min(1).max(100).optional().default(100),
         max_tickets: z.number().int().min(1).max(5000).optional().default(500),
 
+        include_csat: z.boolean().optional().default(true),
+        include_metrics: z.boolean().optional().default(true),
         include_comments: z.boolean().optional().default(false),
-        include_csat: z.boolean().optional().default(false),
+
         include_resolved_audits: z.boolean().optional().default(false),
-        max_text_chars: z.number().int().min(200).max(5000).optional().default(2000),
+        max_text_chars: z.number().int().min(200).max(10000).optional().default(5000),
+
+        only_bad_csat: z.boolean().optional().default(false),
+        resolution_time_gt_hrs: z.number().min(0).optional(),
       }),
     },
     async ({
-      email,
-      start_date,
-      end_date,
+      query,
       per_page,
       max_tickets,
-      include_comments,
       include_csat,
+      include_metrics,
+      include_comments,
       include_resolved_audits,
       max_text_chars,
+      only_bad_csat,
+      resolution_time_gt_hrs,
     }) => {
       const zd = zendeskClient();
       const runLimited = limiter(6);
-
-      // 1) Find user by email
-      const userSearch = await safeGet(zd, '/api/v2/users/search.json', {
-        query: `email:${email}`,
-      });
-      const user = (userSearch?.users || [])[0];
-      if (!user?.id) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                { requester: { email }, tickets: [], note: 'No requester found for email.' },
-                null,
-                2
-              ),
-            },
-          ],
-          structuredContent: {
-            requester: { email },
-            tickets: [],
-            note: 'No requester found for email.',
-          },
-        };
-      }
-
-      const requesterId = user.id;
-
-      // 2) Search tickets by requester_id (paginate)
-      let query = `type:ticket requester_id:${requesterId}`;
-      if (start_date) query += ` created>=${start_date}`;
-      if (end_date) query += ` created<=${end_date}`;
 
       const firstUrl = `/api/v2/search.json?${new URLSearchParams({
         query,
@@ -428,181 +472,68 @@ function createMcpServer() {
         sort_order: 'desc',
       }).toString()}`;
 
-      const rawTickets = await fetchAllSearch(zd, firstUrl, max_tickets, 200);
+      const raw = await fetchAllSearch(zd, firstUrl, max_tickets, 200);
 
-      // Batch fetch agent names
-      const assigneeIds = Array.from(new Set(rawTickets.map((t) => t.assignee_id).filter(Boolean)));
-      const agentNameById = {};
-      if (assigneeIds.length) {
-        const usersMany = await safeGet(zd, '/api/v2/users/show_many.json', {
-          ids: assigneeIds.join(','),
-        });
-        for (const u of usersMany?.users || []) agentNameById[u.id] = u.name;
-      }
+      // Batch user fetch (requester, submitter, assignee)
+      const requesterIds = raw.map((t) => t.requester_id).filter(Boolean);
+      const submitterIds = raw.map((t) => t.submitter_id).filter(Boolean);
+      const assigneeIds = raw.map((t) => t.assignee_id).filter(Boolean);
+      const userMap = await fetchUsersByIds(zd, [...requesterIds, ...submitterIds, ...assigneeIds]);
 
       const tickets = await Promise.all(
-        rawTickets.map((t) =>
+        raw.map((t) =>
           runLimited(async () => {
             const ticket_id = t.id;
-            const created_at = t.created_at;
-            const status = t.status;
-            const priority = t.priority || 'normal';
-            const channel = t.via?.channel || null;
-            const tags = t.tags || [];
-            const subject = t.subject || '';
 
-            const agent_name = t.assignee_id ? agentNameById[t.assignee_id] || null : null;
+            const requester = userMap[t.requester_id] || null;
+            const submitter = userMap[t.submitter_id] || null;
+            const assignee = userMap[t.assignee_id] || null;
 
             const { resolved_at, resolution_time_hrs } = await resolveResolvedAt({
               zd,
               ticket_id,
-              created_at,
+              created_at: t.created_at,
               solved_at: t.solved_at,
               closed_at: t.closed_at,
               include_resolved_audits,
             });
 
-            let csat_score = null;
-            if (include_csat) {
-              const csat = await safeGet(
-                zd,
-                `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`
-              );
-              csat_score = csat?.satisfaction_rating?.score || null;
+            const csat_score = include_csat ? await getCсатScore(zd, ticket_id) : null;
+            if (only_bad_csat && csat_score !== 'bad') return null;
+
+            const metrics = include_metrics ? await getTicketMetrics(zd, ticket_id) : null;
+
+            if (resolution_time_gt_hrs != null) {
+              const hrsFromMetrics = metrics?.resolution_time_hrs_from_metrics ?? null;
+              const hrsFallback = resolution_time_hrs ?? null;
+              const hrs = hrsFromMetrics ?? hrsFallback;
+              if (hrs == null || hrs <= resolution_time_gt_hrs) return null;
             }
 
-            let user_message = null;
-            let agent_response = null;
-            if (include_comments) {
-              const msg = await buildMessagesFromComments({
-                zd,
-                ticket_id,
-                requester_id: requesterId,
-                max_text_chars,
-                include_author_map: false,
-              });
-              user_message = msg.user_message;
-              agent_response = msg.agent_response;
-            }
+            const commentBlobs = include_comments
+              ? await buildPublicPrivateComments({ zd, ticket_id, max_text_chars })
+              : { public_comments: null, private_comments: null };
 
-            return {
-              ticket_id,
-              created_at,
-              resolved_at,
-              status,
-              priority,
-              channel,
-              tags,
-              subject,
-              user_message,
-              agent_response,
+            return buildNormalizedRecord({
+              t,
+              requester,
+              submitter,
+              assignee,
               csat_score,
-              agent_name,
+              metrics,
+              resolved_at,
               resolution_time_hrs,
-            };
+              commentBlobs,
+            });
           })
         )
       );
 
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ requester: { id: requesterId, email }, tickets }, null, 2) }],
-        structuredContent: { requester: { id: requesterId, email }, tickets },
-      };
-    }
-  );
-
-  /**
-   * ✅ get_ticket(ticket_id) — deep dive: full thread + CSAT
-   */
-  server.registerTool(
-    'get_ticket',
-    {
-      description:
-        'Get one Zendesk ticket with full conversation thread + CSAT; includes normalized fields.',
-      inputSchema: z.object({
-        ticket_id: z.number().int(),
-        include_csat: z.boolean().optional().default(true),
-        include_resolved_audits: z.boolean().optional().default(false),
-        max_text_chars: z.number().int().min(200).max(10000).optional().default(5000),
-      }),
-    },
-    async ({ ticket_id, include_csat, include_resolved_audits, max_text_chars }) => {
-      const zd = zendeskClient();
-
-      const tWrap = await safeGet(zd, `/api/v2/tickets/${ticket_id}.json`);
-      if (!tWrap?.ticket) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ error: 'Ticket not found' }, null, 2) }],
-          structuredContent: { error: 'Ticket not found' },
-        };
-      }
-
-      const t = tWrap.ticket;
-
-      let agent_name = null;
-      if (t.assignee_id) {
-        const u = await safeGet(zd, `/api/v2/users/${t.assignee_id}.json`);
-        agent_name = u?.user?.name || null;
-      }
-
-      const { resolved_at, resolution_time_hrs } = await resolveResolvedAt({
-        zd,
-        ticket_id,
-        created_at: t.created_at,
-        solved_at: t.solved_at,
-        closed_at: t.closed_at,
-        include_resolved_audits,
-      });
-
-      let csat_score = null;
-      let csat_detail = null;
-      if (include_csat) {
-        const csat = await safeGet(zd, `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`);
-        csat_score = csat?.satisfaction_rating?.score || null;
-        csat_detail = csat?.satisfaction_rating || null;
-      }
-
-      const msg = await buildMessagesFromComments({
-        zd,
-        ticket_id,
-        requester_id: t.requester_id || null,
-        max_text_chars,
-        include_author_map: true,
-      });
-
-      const normalized = {
-        ticket_id: t.id,
-        created_at: t.created_at,
-        resolved_at,
-        status: t.status,
-        priority: t.priority || 'normal',
-        channel: t.via?.channel || null,
-        tags: t.tags || [],
-        subject: t.subject || '',
-        user_message: msg.user_message,
-        agent_response: msg.agent_response,
-        csat_score,
-        agent_name,
-        resolution_time_hrs,
-      };
-
-      const output = {
-        normalized,
-        thread: msg.thread,
-        csat_detail,
-        zendesk: {
-          url: `https://${ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/${t.id}`,
-          assignee_id: t.assignee_id || null,
-          requester_id: t.requester_id || null,
-          group_id: t.group_id || null,
-          brand_id: t.brand_id || null,
-          updated_at: t.updated_at || null,
-        },
-      };
+      const cleaned = tickets.filter(Boolean);
 
       return {
-        content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-        structuredContent: output,
+        content: [{ type: 'text', text: JSON.stringify({ tickets: cleaned }, null, 2) }],
+        structuredContent: { tickets: cleaned },
       };
     }
   );
