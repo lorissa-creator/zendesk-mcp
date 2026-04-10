@@ -8,15 +8,9 @@ services:
     autoDeploy: true
     healthCheckPath: /health
     envVars:
-      - key: MCP_SHARED_SECRET
-        sync: false
       - key: ZENDESK_SUBDOMAIN
         sync: false
       - key: ZENDESK_EMAIL
         sync: false
       - key: ZENDESK_API_TOKEN
-        sync: false
-      - key: KNOWN_BOT_EMAILS
-        sync: false
-      - key: KNOWN_BOT_NAMES
         sync: false
