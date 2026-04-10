@@ -1,9 +1,12 @@
 /**
- * Minimal Zendesk MCP (debug version)
+ * Zendesk MCP — compact metadata + full conversation
+ *
+ * Access pattern:
+ *   /mcp/:secret
  *
  * Tools:
  * - ping
- * - search_tickets
+ * - search_tickets_compact
  * - get_ticket_conversation
  */
 
@@ -17,8 +20,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 
 const PORT = process.env.PORT || 3000;
 
-// TEMP: auth disabled for debugging
-// const MCP_SHARED_SECRET = (process.env.MCP_SHARED_SECRET || '').trim();
+// Path-based secret for shareable MCP URL
+const MCP_ROUTE_SECRET = (process.env.MCP_ROUTE_SECRET || '').trim();
 
 const ZENDESK_SUBDOMAIN = (process.env.ZENDESK_SUBDOMAIN || '').trim();
 const ZENDESK_EMAIL = (process.env.ZENDESK_EMAIL || '').trim();
@@ -63,10 +66,17 @@ function chunkArray(arr, size) {
   return out;
 }
 
-function truncate(text, maxChars = 12000) {
+function truncate(text, maxChars = 2000) {
   if (text == null) return null;
   const s = String(text);
   return s.length <= maxChars ? s : `${s.slice(0, maxChars)}…`;
+}
+
+function minutesToHours(mins) {
+  if (mins == null) return null;
+  const n = Number(mins);
+  if (!Number.isFinite(n)) return null;
+  return Math.round((n / 60) * 10) / 10;
 }
 
 async function fetchUsersByIds(zd, ids) {
@@ -92,10 +102,52 @@ async function fetchUsersByIds(zd, ids) {
   return map;
 }
 
-function normalizeTicket(t, userMap = {}) {
+async function fetchGroupsByIds(zd, ids) {
+  const unique = uniq(ids);
+  if (!unique.length) return {};
+
+  const chunks = chunkArray(unique, 100);
+  const map = {};
+
+  for (const chunk of chunks) {
+    const data = await safeGet(zd, '/api/v2/groups/show_many.json', { ids: chunk.join(',') });
+    for (const g of data?.groups || []) {
+      map[g.id] = {
+        id: g.id,
+        name: g.name || null,
+      };
+    }
+  }
+
+  return map;
+}
+
+async function getTicketMetrics(zd, ticketId) {
+  const m = await safeGet(zd, `/api/v2/tickets/${ticketId}/metrics.json`);
+  const metric = m?.ticket_metric;
+  if (!metric) return null;
+
+  const firstReplyMin = metric.first_reply_time_in_minutes?.calendar ?? null;
+  const fullResMin = metric.full_resolution_time_in_minutes?.calendar ?? null;
+
+  return {
+    first_reply_time_mins: firstReplyMin,
+    first_reply_time_hrs: minutesToHours(firstReplyMin),
+    resolution_time_mins: fullResMin,
+    resolution_time_hrs: minutesToHours(fullResMin),
+  };
+}
+
+async function getCsatScore(zd, ticketId) {
+  const csat = await safeGet(zd, `/api/v2/tickets/${ticketId}/satisfaction_rating.json`);
+  return csat?.satisfaction_rating?.score || null;
+}
+
+function normalizeCompactTicket(t, userMap = {}, groupMap = {}, extra = {}) {
   const requester = userMap[t.requester_id] || null;
   const assignee = userMap[t.assignee_id] || null;
   const submitter = userMap[t.submitter_id] || null;
+  const group = groupMap[t.group_id] || null;
 
   return {
     ticket_id: t.id,
@@ -106,17 +158,24 @@ function normalizeTicket(t, userMap = {}) {
     updated_at: t.updated_at || null,
     solved_at: t.solved_at || null,
     closed_at: t.closed_at || null,
-    tags: Array.isArray(t.tags) ? t.tags : [],
     channel: t?.via?.channel || null,
-    requester_id: t.requester_id || null,
-    requester_name: requester?.name || null,
+    tags: Array.isArray(t.tags) ? t.tags : [],
     requester_email: requester?.email || null,
+    requester_name: requester?.name || null,
     requester_tags: requester?.tags || [],
-    assignee_id: t.assignee_id || null,
     assignee_name: assignee?.name || null,
     assignee_email: assignee?.email || null,
-    submitter_id: t.submitter_id || null,
     submitter_name: submitter?.name || null,
+    group_id: t.group_id || null,
+    group_name: group?.name || null,
+    csat_score: extra.csat_score ?? null,
+    first_reply_time_mins: extra.first_reply_time_mins ?? null,
+    first_reply_time_hrs: extra.first_reply_time_hrs ?? null,
+    resolution_time_mins: extra.resolution_time_mins ?? null,
+    resolution_time_hrs: extra.resolution_time_hrs ?? null,
+    public_message_count: extra.public_message_count ?? null,
+    first_customer_message_snippet: extra.first_customer_message_snippet ?? null,
+    last_public_reply_snippet: extra.last_public_reply_snippet ?? null,
   };
 }
 
@@ -140,6 +199,21 @@ async function searchPage(zd, { query, per_page = 100, pageUrl = null }) {
   };
 }
 
+async function getConversationSummaryBits(zd, ticketId) {
+  const commentsWrap = await safeGet(zd, `/api/v2/tickets/${ticketId}/comments.json`);
+  const comments = commentsWrap?.comments || [];
+
+  const publicComments = comments.filter((c) => c.public);
+  const firstPublic = publicComments[0] || null;
+  const lastPublic = publicComments[publicComments.length - 1] || null;
+
+  return {
+    public_message_count: publicComments.length,
+    first_customer_message_snippet: truncate(firstPublic?.plain_body || firstPublic?.body || '', 500),
+    last_public_reply_snippet: truncate(lastPublic?.plain_body || lastPublic?.body || '', 500),
+  };
+}
+
 async function getTicketConversation(zd, ticketId, maxTextCharsPerMessage = 12000) {
   const ticketWrap = await safeGet(zd, `/api/v2/tickets/${ticketId}.json`);
   const ticket = ticketWrap?.ticket;
@@ -156,7 +230,17 @@ async function getTicketConversation(zd, ticketId, maxTextCharsPerMessage = 1200
   ]);
 
   const userMap = await fetchUsersByIds(zd, allUserIds);
-  const ticketInfo = normalizeTicket(ticket, userMap);
+  const groupMap = await fetchGroupsByIds(zd, [ticket.group_id].filter(Boolean));
+  const metrics = await getTicketMetrics(zd, ticketId);
+  const csat = await getCsatScore(zd, ticketId);
+
+  const ticketInfo = normalizeCompactTicket(ticket, userMap, groupMap, {
+    csat_score: csat,
+    first_reply_time_mins: metrics?.first_reply_time_mins ?? null,
+    first_reply_time_hrs: metrics?.first_reply_time_hrs ?? null,
+    resolution_time_mins: metrics?.resolution_time_mins ?? null,
+    resolution_time_hrs: metrics?.resolution_time_hrs ?? null,
+  });
 
   const messages = comments.map((c) => {
     const author = userMap[c.author_id] || null;
@@ -192,7 +276,7 @@ async function getTicketConversation(zd, ticketId, maxTextCharsPerMessage = 1200
 
 function createMcpServer() {
   const server = new McpServer(
-    { name: 'zendesk-minimal-mcp', version: '1.0.0' },
+    { name: 'zendesk-mcp', version: '1.0.0' },
     { capabilities: { logging: {} } }
   );
 
@@ -209,18 +293,21 @@ function createMcpServer() {
   );
 
   server.registerTool(
-    'search_tickets',
+    'search_tickets_compact',
     {
       description:
-        'Search Zendesk tickets. Example query: type:ticket requester:customer@email.com tags:subscription created>=2026-04-01',
+        'Search Zendesk tickets and return compact metadata for bulk analysis. Best for tags, requester email, date range, status, and segmentation.',
       inputSchema: z.object({
         query: z.string().min(1),
         per_page: z.number().int().min(1).max(100).optional().default(50),
         next_page: z.string().optional().nullable(),
         max_return: z.number().int().min(1).max(200).optional().default(50),
+        include_metrics: z.boolean().optional().default(false),
+        include_csat: z.boolean().optional().default(false),
+        include_message_snippets: z.boolean().optional().default(false),
       }),
     },
-    async ({ query, per_page, next_page, max_return }) => {
+    async ({ query, per_page, next_page, max_return, include_metrics, include_csat, include_message_snippets }) => {
       const zd = zendeskClient();
       const page = await searchPage(zd, { query, per_page, pageUrl: next_page || null });
       const sliced = (page.results || []).slice(0, max_return);
@@ -229,8 +316,31 @@ function createMcpServer() {
         zd,
         sliced.flatMap((t) => [t.requester_id, t.assignee_id, t.submitter_id]).filter(Boolean)
       );
+      const groupMap = await fetchGroupsByIds(zd, sliced.map((t) => t.group_id).filter(Boolean));
 
-      const tickets = sliced.map((t) => normalizeTicket(t, userMap));
+      const tickets = [];
+      for (const t of sliced) {
+        let metrics = null;
+        let csat = null;
+        let summaryBits = null;
+
+        if (include_metrics) metrics = await getTicketMetrics(zd, t.id);
+        if (include_csat) csat = await getCsatScore(zd, t.id);
+        if (include_message_snippets) summaryBits = await getConversationSummaryBits(zd, t.id);
+
+        tickets.push(
+          normalizeCompactTicket(t, userMap, groupMap, {
+            csat_score: csat,
+            first_reply_time_mins: metrics?.first_reply_time_mins ?? null,
+            first_reply_time_hrs: metrics?.first_reply_time_hrs ?? null,
+            resolution_time_mins: metrics?.resolution_time_mins ?? null,
+            resolution_time_hrs: metrics?.resolution_time_hrs ?? null,
+            public_message_count: summaryBits?.public_message_count ?? null,
+            first_customer_message_snippet: summaryBits?.first_customer_message_snippet ?? null,
+            last_public_reply_snippet: summaryBits?.last_public_reply_snippet ?? null,
+          })
+        );
+      }
 
       return {
         content: [
@@ -260,7 +370,7 @@ function createMcpServer() {
     'get_ticket_conversation',
     {
       description:
-        'Get the full ticket conversation with ordered messages, authors, public/private flag, and combined conversation text.',
+        'Get the full ticket conversation with ordered messages, authors, public/private flags, and combined conversation text for qualitative analysis.',
       inputSchema: z.object({
         ticket_id: z.number().int(),
         max_text_chars_per_message: z.number().int().min(500).max(30000).optional().default(12000),
@@ -287,7 +397,7 @@ function createMcpServer() {
   return server;
 }
 
-// Global MCP transport + server
+// Global transport/server
 const transport = new StreamableHTTPServerTransport({
   sessionIdGenerator: () => randomUUID(),
   enableJsonResponse: true,
@@ -296,39 +406,35 @@ const transport = new StreamableHTTPServerTransport({
 const server = createMcpServer();
 await server.connect(transport);
 
-// HTTP app
 const app = express();
 app.use(express.json({ limit: '4mb' }));
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'zendesk-minimal-mcp',
+    service: 'zendesk-mcp',
   });
 });
 
-app.all('/mcp', async (req, res) => {
+// Secret is part of the path
+app.all('/mcp/:secret', async (req, res) => {
   try {
-    console.log('MCP DEBUG', {
-      method: req.method,
-      url: req.originalUrl,
-      accept: req.headers.accept,
-      contentType: req.headers['content-type'],
-      hasSecret: Boolean(req.query?.secret),
-      secretLength: (req.query?.secret || '').toString().length,
-    });
+    if (!MCP_ROUTE_SECRET) {
+      return res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: 500, message: 'Server secret not configured' },
+        id: null,
+      });
+    }
+
+    const provided = (req.params.secret || '').toString();
+    if (provided !== MCP_ROUTE_SECRET) {
+      return res.status(401).end();
+    }
 
     await transport.handleRequest(req, res);
   } catch (err) {
-    console.error('MCP request error:', {
-      message: err?.message,
-      stack: err?.stack,
-      method: req.method,
-      url: req.originalUrl,
-      accept: req.headers.accept,
-      contentType: req.headers['content-type'],
-    });
-
+    console.error('MCP request error:', err);
     if (!res.headersSent) {
       res.status(500).end();
     }
@@ -336,7 +442,7 @@ app.all('/mcp', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Zendesk Minimal MCP server listening on port ${PORT}`);
-  console.log(`MCP endpoint: /mcp`);
-  console.log('Shared secret gate: DISABLED FOR DEBUGGING');
+  console.log(`Zendesk MCP server listening on port ${PORT}`);
+  console.log(`Health endpoint: /health`);
+  console.log(`Protected MCP endpoint: /mcp/:secret`);
 });
