@@ -1,6 +1,22 @@
 services:
   - type: web
-    name: zendesk-mcp
-    runtime: node
+    name: zendesk-audit-mcp
+    env: node
+    plan: starter
     buildCommand: npm install
     startCommand: npm start
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: MCP_SHARED_SECRET
+        sync: false
+      - key: ZENDESK_SUBDOMAIN
+        sync: false
+      - key: ZENDESK_EMAIL
+        sync: false
+      - key: ZENDESK_API_TOKEN
+        sync: false
+      - key: KNOWN_BOT_EMAILS
+        sync: false
+      - key: KNOWN_BOT_NAMES
+        sync: false
