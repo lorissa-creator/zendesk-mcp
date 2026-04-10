@@ -1,18 +1,6 @@
 services:
   - type: web
     name: zendesk-mcp
-    env: node
-    plan: starter
+    runtime: node
     buildCommand: npm install
     startCommand: npm start
-    autoDeploy: true
-    healthCheckPath: /health
-    envVars:
-      - key: MCP_ROUTE_SECRET
-        sync: false
-      - key: ZENDESK_SUBDOMAIN
-        sync: false
-      - key: ZENDESK_EMAIL
-        sync: false
-      - key: ZENDESK_API_TOKEN
-        sync: false
