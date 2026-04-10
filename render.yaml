@@ -8,6 +8,8 @@ services:
     autoDeploy: true
     healthCheckPath: /health
     envVars:
+      - key: MCP_ROUTE_SECRET
+        sync: false
       - key: ZENDESK_SUBDOMAIN
         sync: false
       - key: ZENDESK_EMAIL
