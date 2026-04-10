@@ -311,24 +311,19 @@ app.all('/mcp', async (req, res) => {
     if (MCP_SHARED_SECRET) {
       const provided = (req.query?.secret || '').toString();
       if (provided !== MCP_SHARED_SECRET) {
-        return res.status(401).json({
-          jsonrpc: '2.0',
-          error: { code: 401, message: 'Unauthorized' },
-          id: null,
-        });
+        return res.status(401).end();
       }
     }
 
-    await transport.handleRequest(req, res, req.body);
+    // VERY IMPORTANT: don't send JSON manually
+    // Let transport fully control the response
+    await transport.handleRequest(req, res);
+
   } catch (err) {
     console.error('MCP request error:', err);
 
     if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: 'Internal server error' },
-        id: null,
-      });
+      res.status(500).end();
     }
   }
 });
