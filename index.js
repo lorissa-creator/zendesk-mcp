@@ -1,5 +1,5 @@
 /**
- * Minimal Zendesk MCP
+ * Minimal Zendesk MCP (debug version)
  *
  * Tools:
  * - ping
@@ -16,7 +16,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 const PORT = process.env.PORT || 3000;
-const MCP_SHARED_SECRET = (process.env.MCP_SHARED_SECRET || '').trim();
+
+// TEMP: auth disabled for debugging
+// const MCP_SHARED_SECRET = (process.env.MCP_SHARED_SECRET || '').trim();
 
 const ZENDESK_SUBDOMAIN = (process.env.ZENDESK_SUBDOMAIN || '').trim();
 const ZENDESK_EMAIL = (process.env.ZENDESK_EMAIL || '').trim();
@@ -154,7 +156,6 @@ async function getTicketConversation(zd, ticketId, maxTextCharsPerMessage = 1200
   ]);
 
   const userMap = await fetchUsersByIds(zd, allUserIds);
-
   const ticketInfo = normalizeTicket(ticket, userMap);
 
   const messages = comments.map((c) => {
@@ -308,19 +309,25 @@ app.get('/health', (req, res) => {
 
 app.all('/mcp', async (req, res) => {
   try {
-    if (MCP_SHARED_SECRET) {
-      const provided = (req.query?.secret || '').toString();
-      if (provided !== MCP_SHARED_SECRET) {
-        return res.status(401).end();
-      }
-    }
+    console.log('MCP DEBUG', {
+      method: req.method,
+      url: req.originalUrl,
+      accept: req.headers.accept,
+      contentType: req.headers['content-type'],
+      hasSecret: Boolean(req.query?.secret),
+      secretLength: (req.query?.secret || '').toString().length,
+    });
 
-    // VERY IMPORTANT: don't send JSON manually
-    // Let transport fully control the response
     await transport.handleRequest(req, res);
-
   } catch (err) {
-    console.error('MCP request error:', err);
+    console.error('MCP request error:', {
+      message: err?.message,
+      stack: err?.stack,
+      method: req.method,
+      url: req.originalUrl,
+      accept: req.headers.accept,
+      contentType: req.headers['content-type'],
+    });
 
     if (!res.headersSent) {
       res.status(500).end();
@@ -331,5 +338,5 @@ app.all('/mcp', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Zendesk Minimal MCP server listening on port ${PORT}`);
   console.log(`MCP endpoint: /mcp`);
-  console.log(`Shared secret gate: ${MCP_SHARED_SECRET ? 'ENABLED' : 'DISABLED'}`);
+  console.log('Shared secret gate: DISABLED FOR DEBUGGING');
 });
