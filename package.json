@@ -1,15 +1,14 @@
 {
-  "name": "zendesk-audit-mcp",
+  "name": "zendesk-minimal-mcp",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node --max-old-space-size=2048 index.js",
-    "dev": "node index.js"
+    "start": "node --max-old-space-size=2048 index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "axios": "^1.7.7",
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "axios": "^1.7.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
     "zod": "^3.23.8"
