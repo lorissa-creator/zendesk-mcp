@@ -178,7 +178,7 @@ async function fetchOrganizationsByIds(zd, ids) {
 
 async function getCsatScore(zd, ticket_id) {
   const csat = await safeGet(zd, `/api/v2/tickets/${ticket_id}/satisfaction_rating.json`);
-  return csat?.satisfaction_rating?.score || null; // good | bad | null
+  return csat?.satisfaction_rating?.score || null;
 }
 
 async function getTicketMetrics(zd, ticket_id) {
@@ -230,13 +230,9 @@ function detectAuthorType(user, requesterId) {
   const role = (user.role || '').toLowerCase();
 
   if (user.id === requesterId) return 'requester';
-
   if (KNOWN_BOT_EMAILS.includes(email) || KNOWN_BOT_NAMES.includes(name)) return 'bot';
-
   if (role === 'agent' || role === 'admin') return 'agent';
-
   if (role === 'end-user') return 'end_user';
-
   if (role === 'system') return 'system';
 
   return 'unknown';
@@ -257,7 +253,6 @@ function normalizeTicketMetadata(t, userMap = {}, groupMap = {}) {
     updated_at: t.updated_at || null,
     closed_at: t.closed_at || null,
     solved_at: t.solved_at || null,
-
     status: t.status || null,
     priority: t.priority || 'normal',
     subject: t.subject || '',
@@ -296,6 +291,7 @@ async function searchPage(zd, { query, per_page = 100, pageUrl = null }) {
 
   const resp = url.startsWith('http') ? await zd.get(url, { baseURL: '' }) : await zd.get(url);
   const data = resp.data || {};
+
   return {
     results: data.results || [],
     next_page: data.next_page || null,
@@ -307,6 +303,7 @@ async function incrementalTicketsPage(zd, { start_time_unix, pageUrl = null }) {
   const url = pageUrl || `/api/v2/incremental/tickets.json?start_time=${start_time_unix}`;
   const resp = url.startsWith('http') ? await zd.get(url, { baseURL: '' }) : await zd.get(url);
   const data = resp.data || {};
+
   return {
     tickets: data.tickets || [],
     next_page: data.next_page || null,
@@ -498,12 +495,13 @@ async function getTicketAuditPayload({
   const agents_in_thread = uniq(
     conversation_messages
       .filter((m) => m.public && m.author_type === 'agent')
-      .map((m) => ({
-        author_id: m.author_id,
-        author_name: m.author_name,
-        author_email: m.author_email,
-      }))
-      .map((x) => JSON.stringify(x))
+      .map((m) =>
+        JSON.stringify({
+          author_id: m.author_id,
+          author_name: m.author_name,
+          author_email: m.author_email,
+        })
+      )
   ).map((x) => JSON.parse(x));
 
   const bots_in_thread = uniq(
@@ -730,8 +728,7 @@ function createMcpServer() {
   server.registerTool(
     'list_tickets_since',
     {
-      description:
-        'List tickets since start_date using Incremental Export (metadata-only, paginated).',
+      description: 'List tickets since start_date using Incremental Export (metadata-only, paginated).',
       inputSchema: z.object({
         start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().default('2026-01-01'),
         end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -908,42 +905,6 @@ function createMcpServer() {
   return server;
 }
 
-// ---------------- Sessions ----------------
-const sessions = new Map();
-const SESSION_TTL_MS = 10 * 60 * 1000;
-
-function cleanupSessions() {
-  const now = Date.now();
-  for (const [sessionId, s] of sessions.entries()) {
-    if (now - s.lastSeen > SESSION_TTL_MS) {
-      try { s.transport.close(); } catch {}
-      try { s.server.close(); } catch {}
-      sessions.delete(sessionId);
-    }
-  }
-}
-setInterval(cleanupSessions, 60 * 1000).unref();
-
-async function getOrCreateSession(sessionId) {
-  const existing = sessions.get(sessionId);
-  if (existing) {
-    existing.lastSeen = Date.now();
-    return existing;
-  }
-
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => sessionId,
-    enableJsonResponse: true,
-  });
-
-  const server = createMcpServer();
-  await server.connect(transport);
-
-  const session = { server, transport, lastSeen: Date.now() };
-  sessions.set(sessionId, session);
-  return session;
-}
-
 // ---------------- HTTP app ----------------
 const app = express();
 app.use(express.json({ limit: '4mb' }));
@@ -968,15 +929,18 @@ app.all('/mcp', async (req, res) => {
       }
     }
 
-    const sessionId =
-      req.headers['mcp-session-id']?.toString() ||
-      req.headers['x-mcp-session-id']?.toString() ||
-      randomUUID();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: true,
+    });
 
-    const session = await getOrCreateSession(sessionId);
-    await session.transport.handleRequest(req, res, req.body);
+    const server = createMcpServer();
+    await server.connect(transport);
+
+    await transport.handleRequest(req, res, req.body);
   } catch (err) {
     console.error('MCP request error:', err);
+
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: '2.0',
