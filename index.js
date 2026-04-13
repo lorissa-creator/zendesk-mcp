@@ -547,7 +547,7 @@ app.all('/mcp', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Zendesk Conversation MCP server listening on port ${PORT}`);
+  console.log(`Zendesk MCP server listening on port ${PORT}`);
   console.log('MCP endpoint: /mcp');
   console.log(`Shared secret gate: ${MCP_SHARED_SECRET ? 'ENABLED' : 'DISABLED'}`);
 });
