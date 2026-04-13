@@ -1,10 +1,11 @@
 /**
- * index.js — Zendesk Conversation Payload MCP
+ * index.js — Zendesk MCP
  *
  * Purpose:
  * - Search tickets by requester email, tag, status, channel, date range, or free text
  * - Return lightweight public conversation payloads for qualitative analysis
  * - Count public agent replies and public requester comments
+ * - Support safer bulk hydration in controlled batches
  *
  * Recommended Render start command:
  *   node --max-old-space-size=1024 index.js
@@ -67,7 +68,7 @@ async function safeGet(zd, url, params) {
   }
 }
 
-function truncate(s, maxChars = 1500) {
+function truncate(s, maxChars = 800) {
   if (s == null) return null;
   const t = String(s);
   return t.length <= maxChars ? t : `${t.slice(0, maxChars)}…`;
@@ -194,7 +195,7 @@ function buildZendeskSearchQuery({
   return parts.join(' ');
 }
 
-async function buildConversationTimeline({ zd, ticket_id, requesterId, max_text_chars_per_message = 1500 }) {
+async function buildConversationTimeline({ zd, ticket_id, requesterId, max_text_chars_per_message = 800 }) {
   const commentsResp = await safeGet(zd, `/api/v2/tickets/${ticket_id}/comments.json`);
   const comments = commentsResp?.comments || [];
 
@@ -241,7 +242,7 @@ async function buildConversationTimeline({ zd, ticket_id, requesterId, max_text_
 async function getPublicConversationPayload({
   zd,
   ticket_id,
-  max_text_chars_per_message = 1500,
+  max_text_chars_per_message = 800,
 }) {
   const ticketWrap = await safeGet(zd, `/api/v2/tickets/${ticket_id}.json`);
   const t = ticketWrap?.ticket;
@@ -299,9 +300,35 @@ async function getPublicConversationPayload({
   };
 }
 
+async function mapWithConcurrency(items, limit, worker) {
+  const results = [];
+  let index = 0;
+
+  async function runWorker() {
+    while (true) {
+      const currentIndex = index++;
+      if (currentIndex >= items.length) break;
+
+      try {
+        results[currentIndex] = await worker(items[currentIndex], currentIndex);
+      } catch (err) {
+        results[currentIndex] = null;
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    () => runWorker()
+  );
+
+  await Promise.all(workers);
+  return results;
+}
+
 function createMcpServer() {
   const server = new McpServer(
-    { name: 'zendesk-mcp', version: '6.0.0' },
+    { name: 'zendesk-mcp', version: '6.1.0' },
     { capabilities: { logging: {} } }
   );
 
@@ -330,8 +357,8 @@ function createMcpServer() {
         free_text: z.string().optional(),
         start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-        per_page: z.number().int().min(1).max(100).optional().default(50),
-        max_return: z.number().int().min(1).max(300).optional().default(100),
+        per_page: z.coerce.number().int().min(1).max(100).optional().default(50),
+        max_return: z.coerce.number().int().min(1).max(300).optional().default(100),
         next_page: z.string().optional().nullable(),
       }),
     },
@@ -406,8 +433,8 @@ function createMcpServer() {
       description:
         'Get public requester comments and public agent replies for one ticket, including counts. Lightweight payload for Claude/GPT analysis.',
       inputSchema: z.object({
-        ticket_id: z.number().int(),
-        max_text_chars_per_message: z.number().int().min(200).max(5000).optional().default(1500),
+        ticket_id: z.coerce.number().int(),
+        max_text_chars_per_message: z.coerce.number().int().min(200).max(5000).optional().default(800),
       }),
     },
     async ({ ticket_id, max_text_chars_per_message }) => {
@@ -437,29 +464,49 @@ function createMcpServer() {
     'get_public_conversation_payload_bulk',
     {
       description:
-        'Get public requester comments and public agent replies for multiple tickets. Use only for a small selected list of ticket IDs.',
+        'Get public requester comments and public agent replies for multiple tickets. Best used in batches of up to 100 selected ticket IDs.',
       inputSchema: z.object({
-        ticket_ids: z.array(z.number().int()).min(1).max(50),
-        max_text_chars_per_message: z.number().int().min(200).max(5000).optional().default(1200),
+        ticket_ids: z.array(z.coerce.number().int()).min(1).max(100),
+        max_text_chars_per_message: z.coerce.number().int().min(200).max(5000).optional().default(800),
       }),
     },
     async ({ ticket_ids, max_text_chars_per_message }) => {
       const zd = zendeskClient();
 
-      const results = [];
-      for (const ticket_id of ticket_ids) {
-        const payload = await getPublicConversationPayload({
-          zd,
-          ticket_id,
-          max_text_chars_per_message,
-        });
+      const results = await mapWithConcurrency(
+        ticket_ids,
+        5,
+        async (ticket_id) => {
+          return await getPublicConversationPayload({
+            zd,
+            ticket_id,
+            max_text_chars_per_message,
+          });
+        }
+      );
 
-        if (payload) results.push(payload);
-      }
+      const filtered = results.filter(Boolean);
 
       return {
-        content: [{ type: 'text', text: JSON.stringify({ tickets: results }, null, 2) }],
-        structuredContent: { tickets: results },
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                tickets: filtered,
+                requested_count: ticket_ids.length,
+                returned_count: filtered.length,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        structuredContent: {
+          tickets: filtered,
+          requested_count: ticket_ids.length,
+          returned_count: filtered.length,
+        },
       };
     }
   );
@@ -505,7 +552,7 @@ async function getOrCreateSession(sessionId) {
 
 // ---------------- HTTP app ----------------
 const app = express();
-app.use(express.json({ limit: '4mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 app.get('/health', (req, res) => {
   res.json({
@@ -535,7 +582,13 @@ app.all('/mcp', async (req, res) => {
     const session = await getOrCreateSession(sessionId);
     await session.transport.handleRequest(req, res, req.body);
   } catch (err) {
-    console.error('MCP request error:', err);
+    console.error('MCP request error:', {
+      message: err?.message,
+      name: err?.name,
+      stack: err?.stack,
+      body: req.body,
+    });
+
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: '2.0',
