@@ -3,4 +3,4 @@ services:
     name: zendesk-mcp
     runtime: node
     buildCommand: npm install
-    startCommand: npm start
+    startCommand: node --max-old-space-size=1024 index.js
