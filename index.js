@@ -301,7 +301,7 @@ async function getPublicConversationPayload({
 
 function createMcpServer() {
   const server = new McpServer(
-    { name: 'zendesk-conversation-mcp', version: '6.0.0' },
+    { name: 'zendesk-mcp', version: '6.0.0' },
     { capabilities: { logging: {} } }
   );
 
@@ -510,7 +510,7 @@ app.use(express.json({ limit: '4mb' }));
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'zendesk-conversation-mcp',
+    service: 'zendesk-mcp',
   });
 });
 
