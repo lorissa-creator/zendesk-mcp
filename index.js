@@ -1,5 +1,5 @@
 /**
- * index.js — Zendesk MCP
+ * index.js — Zendesk MCP v7.2.0
  *
  * Purpose:
  * - Search tickets by requester email, tag, status, channel, date range, or free text
@@ -46,11 +46,10 @@ function zendeskClient() {
       username: `${ZENDESK_EMAIL}/token`,
       password: ZENDESK_API_TOKEN,
     },
-    timeout: 20000, // FIX: reduced from 30s to stay under platform timeouts
+    timeout: 20000,
   });
 }
 
-// FIX: added error logging + 429 retry logic
 async function safeGet(zd, url, params, retries = 2) {
   try {
     const r = await zd.get(url, params ? { params } : undefined);
@@ -137,7 +136,6 @@ function normalizeTicketMetadata(t, userMap = {}) {
   };
 }
 
-// FIX: use plain axios.create for full next-page URLs instead of baseURL: ''
 function makeAbsoluteAxios() {
   requireEnv('ZENDESK_EMAIL', ZENDESK_EMAIL);
   requireEnv('ZENDESK_API_TOKEN', ZENDESK_API_TOKEN);
@@ -152,7 +150,6 @@ function makeAbsoluteAxios() {
 
 async function searchPage(zd, { query, per_page = 100, pageUrl = null }) {
   if (pageUrl) {
-    // FIX: use absolute axios instance for full next-page URLs
     const absoluteZd = makeAbsoluteAxios();
     const resp = await absoluteZd.get(pageUrl);
     const data = resp.data || {};
@@ -201,12 +198,8 @@ function buildZendeskSearchQuery({
 
 function detectAuthorType(user, requesterId, isPublic) {
   const name = (user?.name || '').trim().toLowerCase();
-  if (user?.id === requesterId) {
-    return 'requester';
-  }
-  if (KNOWN_BOT_NAMES.includes(name)) {
-    return isPublic ? 'bot' : 'internal_bot';
-  }
+  if (user?.id === requesterId) return 'requester';
+  if (KNOWN_BOT_NAMES.includes(name)) return isPublic ? 'bot' : 'internal_bot';
   return isPublic ? 'agent' : 'internal_agent_note';
 }
 
@@ -258,11 +251,7 @@ async function buildAuditTimeline({ zd, ticket_id, requesterId, max_text_chars_p
   };
 }
 
-async function getTicketAuditReviewPayload({
-  zd,
-  ticket_id,
-  max_text_chars_per_message = 1500,
-}) {
+async function getTicketAuditReviewPayload({ zd, ticket_id, max_text_chars_per_message = 1500 }) {
   const ticketWrap = await safeGet(zd, `/api/v2/tickets/${ticket_id}.json`);
   const t = ticketWrap?.ticket;
   if (!t) return null;
@@ -333,7 +322,6 @@ async function getTicketAuditReviewPayload({
   };
 }
 
-// FIX: reduced default concurrency from 5 → 3 to avoid Zendesk rate limits during bulk
 async function mapWithConcurrency(items, limit, worker) {
   const results = [];
   let index = 0;
@@ -356,41 +344,37 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
+// FIX: replaced server.registerTool() with server.tool() — required for SDK v1.x
 function createMcpServer() {
   const server = new McpServer(
-    { name: 'zendesk-mcp', version: '7.1.0' },
+    { name: 'zendesk-mcp', version: '7.2.0' },
     { capabilities: { logging: {} } }
   );
 
-  server.registerTool(
+  // ping — no params
+  server.tool(
     'ping',
-    {
-      description: 'Health check tool',
-      inputSchema: z.object({}).passthrough(),
-    },
+    'Health check tool',
     async () => ({
       content: [{ type: 'text', text: 'pong' }],
-      structuredContent: { ok: true },
     })
   );
 
-  server.registerTool(
+  // search_tickets_metadata
+  server.tool(
     'search_tickets_metadata',
+    'Search Zendesk tickets by requester email, ticket tag, status, channel, date range, or free text. Returns metadata only.',
     {
-      description:
-        'Search Zendesk tickets by requester email, ticket tag, status, channel, date range, or free text. Returns metadata only.',
-      inputSchema: z.object({
-        requester_email: z.string().email().optional(),
-        ticket_tag: z.string().optional(),
-        status: z.string().optional(),
-        channel: z.string().optional(),
-        free_text: z.string().optional(),
-        start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-        end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-        per_page: z.coerce.number().int().min(1).max(100).optional().default(50),
-        max_return: z.coerce.number().int().min(1).max(300).optional().default(100),
-        next_page: z.string().optional().nullable(),
-      }),
+      requester_email: z.string().email().optional(),
+      ticket_tag: z.string().optional(),
+      status: z.string().optional(),
+      channel: z.string().optional(),
+      free_text: z.string().optional(),
+      start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      per_page: z.coerce.number().int().min(1).max(100).optional().default(50),
+      max_return: z.coerce.number().int().min(1).max(300).optional().default(100),
+      next_page: z.string().optional().nullable(),
     },
     async ({
       requester_email,
@@ -406,21 +390,10 @@ function createMcpServer() {
     }) => {
       const zd = zendeskClient();
       const query = buildZendeskSearchQuery({
-        requester_email,
-        ticket_tag,
-        status,
-        channel,
-        free_text,
-        start_date,
-        end_date,
+        requester_email, ticket_tag, status, channel, free_text, start_date, end_date,
       });
 
-      const page = await searchPage(zd, {
-        query,
-        per_page,
-        pageUrl: next_page || null,
-      });
-
+      const page = await searchPage(zd, { query, per_page, pageUrl: next_page || null });
       const sliced = (page.results || []).slice(0, max_return);
       const userMap = await fetchUsersByIds(
         zd,
@@ -435,20 +408,17 @@ function createMcpServer() {
             text: JSON.stringify({ query, tickets, next_page: page.next_page, count: page.count }, null, 2),
           },
         ],
-        structuredContent: { query, tickets, next_page: page.next_page, count: page.count },
       };
     }
   );
 
-  server.registerTool(
+  // get_ticket_audit_review_payload
+  server.tool(
     'get_ticket_audit_review_payload',
+    'Get an audit-ready ticket payload including public conversation, internal comments, requester comments, agent replies, bot messages, and full timeline.',
     {
-      description:
-        'Get an audit-ready ticket payload including public conversation, internal comments, requester comments, agent replies, bot messages, and full timeline.',
-      inputSchema: z.object({
-        ticket_id: z.coerce.number().int(),
-        max_text_chars_per_message: z.coerce.number().int().min(200).max(8000).optional().default(1500),
-      }),
+      ticket_id: z.coerce.number().int(),
+      max_text_chars_per_message: z.coerce.number().int().min(200).max(8000).optional().default(1500),
     },
     async ({ ticket_id, max_text_chars_per_message }) => {
       const zd = zendeskClient();
@@ -457,30 +427,25 @@ function createMcpServer() {
       if (!payload) {
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: 'Ticket not found' }) }],
-          structuredContent: { error: 'Ticket not found' },
         };
       }
 
       return {
         content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
-        structuredContent: payload,
       };
     }
   );
 
-  server.registerTool(
+  // get_ticket_audit_review_payload_bulk
+  server.tool(
     'get_ticket_audit_review_payload_bulk',
+    'Get audit-ready payloads for multiple tickets. Best used in batches of up to 100 selected ticket IDs.',
     {
-      description:
-        'Get audit-ready payloads for multiple tickets. Best used in batches of up to 100 selected ticket IDs.',
-      inputSchema: z.object({
-        ticket_ids: z.array(z.coerce.number().int()).min(1).max(100),
-        max_text_chars_per_message: z.coerce.number().int().min(200).max(8000).optional().default(1200),
-      }),
+      ticket_ids: z.array(z.coerce.number().int()).min(1).max(100),
+      max_text_chars_per_message: z.coerce.number().int().min(200).max(8000).optional().default(1200),
     },
     async ({ ticket_ids, max_text_chars_per_message }) => {
       const zd = zendeskClient();
-      // FIX: concurrency reduced from 5 → 3 to reduce rate-limit risk on large batches
       const results = await mapWithConcurrency(ticket_ids, 3, async (ticket_id) =>
         getTicketAuditReviewPayload({ zd, ticket_id, max_text_chars_per_message })
       );
@@ -497,11 +462,6 @@ function createMcpServer() {
             ),
           },
         ],
-        structuredContent: {
-          tickets: filtered,
-          requested_count: ticket_ids.length,
-          returned_count: filtered.length,
-        },
       };
     }
   );
@@ -517,8 +477,6 @@ function cleanupSessions() {
   const now = Date.now();
   for (const [sessionId, s] of sessions.entries()) {
     if (now - s.lastSeen > SESSION_TTL_MS) {
-      // FIX: removed s.server.close() — McpServer has no .close() method
-      // Only close the transport
       try { s.transport.close(); } catch {}
       sessions.delete(sessionId);
       console.log(`[session] expired and cleaned up: ${sessionId}`);
@@ -553,7 +511,6 @@ async function getOrCreateSession(sessionId) {
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// FIX: health endpoint now validates required env vars
 app.get('/health', (req, res) => {
   const required = ['ZENDESK_SUBDOMAIN', 'ZENDESK_EMAIL', 'ZENDESK_API_TOKEN'];
   const missing = required.filter((k) => !process.env[k]?.trim());
@@ -563,11 +520,7 @@ app.get('/health', (req, res) => {
     return res.status(500).json({ status: 'error', missing });
   }
 
-  res.json({
-    status: 'ok',
-    service: 'zendesk-mcp',
-    active_sessions: sessions.size,
-  });
+  res.json({ status: 'ok', service: 'zendesk-mcp', active_sessions: sessions.size });
 });
 
 app.all('/mcp', async (req, res) => {
@@ -612,7 +565,6 @@ app.listen(PORT, () => {
   console.log('MCP endpoint: /mcp');
   console.log(`Shared secret gate: ${MCP_SHARED_SECRET ? 'ENABLED' : 'DISABLED'}`);
 
-  // FIX: warn immediately on startup if env vars are missing
   const required = ['ZENDESK_SUBDOMAIN', 'ZENDESK_EMAIL', 'ZENDESK_API_TOKEN'];
   const missing = required.filter((k) => !process.env[k]?.trim());
   if (missing.length) {
