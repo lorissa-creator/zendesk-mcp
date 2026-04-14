@@ -347,7 +347,7 @@ async function mapWithConcurrency(items, limit, worker) {
 // FIX: replaced server.registerTool() with server.tool() — required for SDK v1.x
 function createMcpServer() {
   const server = new McpServer(
-    { name: 'zendesk-mcp', version: '7.2.0' },
+    { name: 'zendesk-mcp', version: '7.3.0' },
     { capabilities: { logging: {} } }
   );
 
@@ -470,41 +470,18 @@ function createMcpServer() {
 }
 
 // ---------------- Sessions ----------------
-const sessions = new Map();
-const SESSION_TTL_MS = 10 * 60 * 1000;
+// One transport per session. Created on first POST (initialize), reused for
+// subsequent POST (tool calls) and GET (SSE event stream) requests.
+const transports = new Map(); // sessionId → StreamableHTTPServerTransport
 
-function cleanupSessions() {
-  const now = Date.now();
-  for (const [sessionId, s] of sessions.entries()) {
-    if (now - s.lastSeen > SESSION_TTL_MS) {
-      try { s.transport.close(); } catch {}
-      sessions.delete(sessionId);
-      console.log(`[session] expired and cleaned up: ${sessionId}`);
-    }
+function checkSecret(req, res) {
+  if (!MCP_SHARED_SECRET) return true;
+  const provided = (req.query?.secret || '').toString();
+  if (provided !== MCP_SHARED_SECRET) {
+    res.status(401).json({ jsonrpc: '2.0', error: { code: 401, message: 'Unauthorized' }, id: null });
+    return false;
   }
-}
-
-setInterval(cleanupSessions, 60 * 1000).unref();
-
-async function getOrCreateSession(sessionId) {
-  const existing = sessions.get(sessionId);
-  if (existing) {
-    existing.lastSeen = Date.now();
-    return existing;
-  }
-
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => sessionId,
-    enableJsonResponse: true,
-  });
-
-  const server = createMcpServer();
-  await server.connect(transport);
-
-  const session = { server, transport, lastSeen: Date.now() };
-  sessions.set(sessionId, session);
-  console.log(`[session] created: ${sessionId}`);
-  return session;
+  return true;
 }
 
 // ---------------- HTTP app ----------------
@@ -514,50 +491,88 @@ app.use(express.json({ limit: '10mb' }));
 app.get('/health', (req, res) => {
   const required = ['ZENDESK_SUBDOMAIN', 'ZENDESK_EMAIL', 'ZENDESK_API_TOKEN'];
   const missing = required.filter((k) => !process.env[k]?.trim());
-
   if (missing.length) {
     console.error('[health] Missing env vars:', missing);
     return res.status(500).json({ status: 'error', missing });
   }
-
-  res.json({ status: 'ok', service: 'zendesk-mcp', active_sessions: sessions.size });
+  res.json({ status: 'ok', service: 'zendesk-mcp', active_sessions: transports.size });
 });
 
-app.all('/mcp', async (req, res) => {
+// POST /mcp — initialize new session OR handle tool calls on existing session
+app.post('/mcp', async (req, res) => {
+  if (!checkSecret(req, res)) return;
   try {
-    if (MCP_SHARED_SECRET) {
-      const provided = (req.query?.secret || '').toString();
-      if (provided !== MCP_SHARED_SECRET) {
-        return res.status(401).json({
-          jsonrpc: '2.0',
-          error: { code: 401, message: 'Unauthorized' },
-          id: null,
-        });
+    const sessionId = req.headers['mcp-session-id']?.toString();
+
+    if (sessionId) {
+      // Existing session — route to its transport
+      const transport = transports.get(sessionId);
+      if (!transport) {
+        return res.status(404).json({ error: 'Session not found or expired' });
       }
+      await transport.handleRequest(req, res, req.body);
+      return;
     }
 
-    const sessionId =
-      req.headers['mcp-session-id']?.toString() ||
-      req.headers['x-mcp-session-id']?.toString() ||
-      randomUUID();
-
-    const session = await getOrCreateSession(sessionId);
-    await session.transport.handleRequest(req, res, req.body);
-  } catch (err) {
-    console.error('MCP request error:', {
-      message: err?.message,
-      name: err?.name,
-      stack: err?.stack,
-      body: req.body,
+    // New session — create transport + server
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: randomUUID,
+      onsessioninitialized: (newSessionId) => {
+        transports.set(newSessionId, transport);
+        console.log(`[session] created: ${newSessionId} (total: ${transports.size})`);
+      },
     });
+
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        transports.delete(transport.sessionId);
+        console.log(`[session] closed: ${transport.sessionId}`);
+      }
+    };
+
+    const server = createMcpServer();
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('POST /mcp error:', { message: err?.message, stack: err?.stack });
     if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: 'Internal server error' },
-        id: null,
-      });
+      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
     }
   }
+});
+
+// GET /mcp — SSE event stream for an existing session
+app.get('/mcp', async (req, res) => {
+  if (!checkSecret(req, res)) return;
+  try {
+    const sessionId = req.headers['mcp-session-id']?.toString();
+    if (!sessionId) {
+      return res.status(400).json({ error: 'Missing mcp-session-id header' });
+    }
+    const transport = transports.get(sessionId);
+    if (!transport) {
+      return res.status(404).json({ error: 'Session not found or expired' });
+    }
+    await transport.handleRequest(req, res);
+  } catch (err) {
+    console.error('GET /mcp error:', { message: err?.message, stack: err?.stack });
+    if (!res.headersSent) res.status(500).end();
+  }
+});
+
+// DELETE /mcp — explicit session teardown
+app.delete('/mcp', async (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const sessionId = req.headers['mcp-session-id']?.toString();
+  if (sessionId) {
+    const transport = transports.get(sessionId);
+    if (transport) {
+      try { await transport.close(); } catch {}
+      transports.delete(sessionId);
+      console.log(`[session] deleted: ${sessionId}`);
+    }
+  }
+  res.status(200).json({ ok: true });
 });
 
 app.listen(PORT, () => {
