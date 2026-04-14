@@ -3,12 +3,15 @@
  *
  * Purpose:
  * - Search tickets by requester email, tag, status, channel, date range, or free text
- * - Return lightweight public conversation payloads for qualitative analysis
- * - Count public agent replies and public requester comments
+ * - Return audit-ready ticket payloads for QA/compliance review
+ * - Include public conversation and internal comments
+ * - Count public replies, requester messages, and internal notes
  * - Support safer bulk hydration in controlled batches
  *
- * Recommended Render start command:
- *   node --max-old-space-size=1024 index.js
+ * Bot rules:
+ * - requester = comment author matches ticket.requester_id
+ * - bot names = Jené, Luna, Rachel Mint, Rachel
+ * - everyone else = agent
  */
 
 import 'dotenv/config';
@@ -21,21 +24,14 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 
 const PORT = process.env.PORT || 3000;
 
-// Optional shared secret
 const MCP_SHARED_SECRET = (process.env.MCP_SHARED_SECRET || '').trim();
 
-// Zendesk creds
 const ZENDESK_SUBDOMAIN = (process.env.ZENDESK_SUBDOMAIN || '').trim();
 const ZENDESK_EMAIL = (process.env.ZENDESK_EMAIL || '').trim();
 const ZENDESK_API_TOKEN = (process.env.ZENDESK_API_TOKEN || '').trim();
 
-// Optional: comma-separated known bot emails or names
-const KNOWN_BOT_EMAILS = (process.env.KNOWN_BOT_EMAILS || '')
-  .split(',')
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
-
-const KNOWN_BOT_NAMES = (process.env.KNOWN_BOT_NAMES || '')
+// Optional, but defaulted to your known bot names
+const KNOWN_BOT_NAMES = (process.env.KNOWN_BOT_NAMES || 'Jené,Luna,Rachel Mint,Rachel')
   .split(',')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
@@ -63,12 +59,12 @@ async function safeGet(zd, url, params) {
   try {
     const r = await zd.get(url, params ? { params } : undefined);
     return r.data;
-  } catch (e) {
+  } catch {
     return null;
   }
 }
 
-function truncate(s, maxChars = 800) {
+function truncate(s, maxChars = 1500) {
   if (s == null) return null;
   const t = String(s);
   return t.length <= maxChars ? t : `${t.slice(0, maxChars)}…`;
@@ -105,22 +101,6 @@ async function fetchUsersByIds(zd, ids) {
   }
 
   return map;
-}
-
-function detectAuthorType(user, requesterId) {
-  if (!user) return 'unknown';
-
-  const email = (user.email || '').toLowerCase();
-  const name = (user.name || '').toLowerCase();
-  const role = (user.role || '').toLowerCase();
-
-  if (user.id === requesterId) return 'requester';
-  if (KNOWN_BOT_EMAILS.includes(email) || KNOWN_BOT_NAMES.includes(name)) return 'bot';
-  if (role === 'agent' || role === 'admin') return 'agent';
-  if (role === 'end-user') return 'end_user';
-  if (role === 'system') return 'system';
-
-  return 'unknown';
 }
 
 function parseTicketSource(t) {
@@ -195,7 +175,21 @@ function buildZendeskSearchQuery({
   return parts.join(' ');
 }
 
-async function buildConversationTimeline({ zd, ticket_id, requesterId, max_text_chars_per_message = 800 }) {
+function detectAuthorType(user, requesterId, isPublic) {
+  const name = (user?.name || '').trim().toLowerCase();
+
+  if (user?.id === requesterId) {
+    return 'requester';
+  }
+
+  if (KNOWN_BOT_NAMES.includes(name)) {
+    return isPublic ? 'bot' : 'internal_bot';
+  }
+
+  return isPublic ? 'agent' : 'internal_agent_note';
+}
+
+async function buildAuditTimeline({ zd, ticket_id, requesterId, max_text_chars_per_message = 1500 }) {
   const commentsResp = await safeGet(zd, `/api/v2/tickets/${ticket_id}/comments.json`);
   const comments = commentsResp?.comments || [];
 
@@ -204,18 +198,20 @@ async function buildConversationTimeline({ zd, ticket_id, requesterId, max_text_
 
   const messages = [];
   let publicAgentReplies = 0;
-  let publicCustomerMessages = 0;
-  let botMessages = 0;
+  let publicRequesterMessages = 0;
+  let internalCommentCount = 0;
+  let botMessageCount = 0;
 
   for (const c of comments) {
+    const isPublic = !!c.public;
     const user = userMap[c.author_id] || null;
-    const authorType = detectAuthorType(user, requesterId);
+    const authorType = detectAuthorType(user, requesterId, isPublic);
     const body = (c.plain_body || c.body || '').trim();
 
     const message = {
       comment_id: c.id || null,
       created_at: c.created_at || null,
-      public: !!c.public,
+      public: isPublic,
       author_id: c.author_id || null,
       author_name: user?.name || null,
       author_email: user?.email || null,
@@ -224,9 +220,10 @@ async function buildConversationTimeline({ zd, ticket_id, requesterId, max_text_
       body: truncate(body, max_text_chars_per_message),
     };
 
-    if (message.public && message.author_type === 'agent') publicAgentReplies += 1;
-    if (message.public && message.author_type === 'requester') publicCustomerMessages += 1;
-    if (message.public && message.author_type === 'bot') botMessages += 1;
+    if (isPublic && authorType === 'agent') publicAgentReplies += 1;
+    if (isPublic && authorType === 'requester') publicRequesterMessages += 1;
+    if (!isPublic) internalCommentCount += 1;
+    if (isPublic && authorType === 'bot') botMessageCount += 1;
 
     messages.push(message);
   }
@@ -234,21 +231,29 @@ async function buildConversationTimeline({ zd, ticket_id, requesterId, max_text_
   return {
     messages,
     public_agent_reply_count: publicAgentReplies,
-    public_requester_message_count: publicCustomerMessages,
-    bot_message_count: botMessages,
+    public_requester_message_count: publicRequesterMessages,
+    internal_comment_count: internalCommentCount,
+    bot_message_count: botMessageCount,
   };
 }
 
-async function getPublicConversationPayload({
+async function getTicketAuditReviewPayload({
   zd,
   ticket_id,
-  max_text_chars_per_message = 800,
+  max_text_chars_per_message = 1500,
 }) {
   const ticketWrap = await safeGet(zd, `/api/v2/tickets/${ticket_id}.json`);
   const t = ticketWrap?.ticket;
   if (!t) return null;
 
-  const timeline = await buildConversationTimeline({
+  const userMap = await fetchUsersByIds(
+    zd,
+    [t.requester_id, t.submitter_id, t.assignee_id].filter(Boolean)
+  );
+
+  const metadata = normalizeTicketMetadata(t, userMap);
+
+  const timeline = await buildAuditTimeline({
     zd,
     ticket_id,
     requesterId: t.requester_id,
@@ -256,11 +261,22 @@ async function getPublicConversationPayload({
   });
 
   const publicConversation = timeline.messages
-    .filter((m) => m.public && ['requester', 'agent', 'bot'].includes(m.author_type))
+    .filter((m) => m.public)
     .map((m) => ({
       created_at: m.created_at,
       author_type: m.author_type,
       author_name: m.author_name,
+      author_role: m.author_role,
+      body: m.body,
+    }));
+
+  const internalComments = timeline.messages
+    .filter((m) => !m.public)
+    .map((m) => ({
+      created_at: m.created_at,
+      author_type: m.author_type,
+      author_name: m.author_name,
+      author_role: m.author_role,
       body: m.body,
     }));
 
@@ -289,14 +305,23 @@ async function getPublicConversationPayload({
     }));
 
   return {
-    ticket_id,
+    ...metadata,
     public_agent_reply_count: timeline.public_agent_reply_count,
     public_requester_message_count: timeline.public_requester_message_count,
+    internal_comment_count: timeline.internal_comment_count,
     bot_message_count: timeline.bot_message_count,
     requester_comments: requesterComments,
     agent_replies: agentReplies,
     bot_messages: botMessages,
-    public_conversation: publicConversation,
+    internal_comments: internalComments,
+    full_timeline: timeline.messages.map((m) => ({
+      created_at: m.created_at,
+      public: m.public,
+      author_type: m.author_type,
+      author_name: m.author_name,
+      author_role: m.author_role,
+      body: m.body,
+    })),
   };
 }
 
@@ -311,7 +336,7 @@ async function mapWithConcurrency(items, limit, worker) {
 
       try {
         results[currentIndex] = await worker(items[currentIndex], currentIndex);
-      } catch (err) {
+      } catch {
         results[currentIndex] = null;
       }
     }
@@ -328,7 +353,7 @@ async function mapWithConcurrency(items, limit, worker) {
 
 function createMcpServer() {
   const server = new McpServer(
-    { name: 'zendesk-mcp', version: '6.1.0' },
+    { name: 'zendesk-mcp', version: '7.0.0' },
     { capabilities: { logging: {} } }
   );
 
@@ -428,19 +453,19 @@ function createMcpServer() {
   );
 
   server.registerTool(
-    'get_public_conversation_payload',
+    'get_ticket_audit_review_payload',
     {
       description:
-        'Get public requester comments and public agent replies for one ticket, including counts. Lightweight payload for Claude/GPT analysis.',
+        'Get an audit-ready ticket payload including public conversation, internal comments, requester comments, agent replies, bot messages, and full timeline.',
       inputSchema: z.object({
         ticket_id: z.coerce.number().int(),
-        max_text_chars_per_message: z.coerce.number().int().min(200).max(5000).optional().default(800),
+        max_text_chars_per_message: z.coerce.number().int().min(200).max(8000).optional().default(1500),
       }),
     },
     async ({ ticket_id, max_text_chars_per_message }) => {
       const zd = zendeskClient();
 
-      const payload = await getPublicConversationPayload({
+      const payload = await getTicketAuditReviewPayload({
         zd,
         ticket_id,
         max_text_chars_per_message,
@@ -461,13 +486,13 @@ function createMcpServer() {
   );
 
   server.registerTool(
-    'get_public_conversation_payload_bulk',
+    'get_ticket_audit_review_payload_bulk',
     {
       description:
-        'Get public requester comments and public agent replies for multiple tickets. Best used in batches of up to 100 selected ticket IDs.',
+        'Get audit-ready payloads for multiple tickets. Best used in batches of up to 100 selected ticket IDs.',
       inputSchema: z.object({
         ticket_ids: z.array(z.coerce.number().int()).min(1).max(100),
-        max_text_chars_per_message: z.coerce.number().int().min(200).max(5000).optional().default(800),
+        max_text_chars_per_message: z.coerce.number().int().min(200).max(8000).optional().default(1200),
       }),
     },
     async ({ ticket_ids, max_text_chars_per_message }) => {
@@ -476,13 +501,12 @@ function createMcpServer() {
       const results = await mapWithConcurrency(
         ticket_ids,
         5,
-        async (ticket_id) => {
-          return await getPublicConversationPayload({
+        async (ticket_id) =>
+          getTicketAuditReviewPayload({
             zd,
             ticket_id,
             max_text_chars_per_message,
-          });
-        }
+          })
       );
 
       const filtered = results.filter(Boolean);
