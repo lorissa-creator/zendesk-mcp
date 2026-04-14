@@ -1,20 +1,13 @@
 {
   "name": "zendesk-mcp",
-  "version": "6.1.0",
-  "private": true,
-  "type": "module",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "version": "7.1.0",
+  ...
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "1.10.2",   ← pin this exact version
     "axios": "^1.7.9",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "zod": "^3.23.8"
   },
-  "engines": {
-    "node": ">=20"
-  }
+  ...
 }
