@@ -32,6 +32,12 @@ const KNOWN_BOT_NAMES = (process.env.KNOWN_BOT_NAMES || 'Jené,Luna,Rachel Mint,
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
+// AI Summary custom field ID — set ZENDESK_AI_SUMMARY_FIELD_ID in your .env file
+// To find it: GET /api/v2/ticket_fields.json and look for the "AI Summary" field id
+const AI_SUMMARY_FIELD_ID = process.env.ZENDESK_AI_SUMMARY_FIELD_ID
+  ? Number(process.env.ZENDESK_AI_SUMMARY_FIELD_ID)
+  : 37320056246937;
+
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
 }
@@ -106,6 +112,12 @@ async function fetchUsersByIds(zd, ids) {
   return map;
 }
 
+function getCustomField(ticket, fieldId) {
+  if (!fieldId || !Array.isArray(ticket?.custom_fields)) return null;
+  const field = ticket.custom_fields.find((cf) => cf.id === fieldId);
+  return field?.value ?? null;
+}
+
 function parseTicketSource(t) {
   const channel = t?.via?.channel || null;
   const source = t?.via?.source || null;
@@ -133,6 +145,7 @@ function normalizeTicketMetadata(t, userMap = {}) {
     assignee_email: assignee?.email || null,
     channel,
     ticket_source: via,
+    ai_summary: getCustomField(t, AI_SUMMARY_FIELD_ID),
   };
 }
 
